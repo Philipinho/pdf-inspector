@@ -654,6 +654,12 @@ impl TextLine {
 /// Determine if two adjacent text items should be joined without a space
 /// based on their physical positions on the page and character case.
 /// Uses a hybrid approach: position-based with case-aware thresholds.
+/// CID fonts emit one word per text operator with gaps ≈ 0 between words.
+/// Non-CID (Type1/TrueType) fonts emit phrases or fragments.
+fn is_cid_font(font: &str) -> bool {
+    font.starts_with("C2_") || font.starts_with("C0_")
+}
+
 fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
     // If either text explicitly has leading/trailing spaces, respect them
     if prev_item.text.ends_with(' ') || curr_item.text.starts_with(' ') {
@@ -691,17 +697,11 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
             return false;
         }
 
-        // When items perfectly touch (gap ≈ 0) and both are multi-character,
-        // they are likely separate words from different text operators (CID fonts).
-        // Single-character items (per-glyph positioning) should still be joined.
+        // CID fonts (C2_*, C0_*) emit one word per text operator with gaps ≈ 0
+        // between words. Detect these and add spaces. Only applies to CID fonts —
+        // non-CID fonts (Type1/TrueType) emit phrases or fragments with small gaps
+        // from positioning imprecision and should NOT trigger this.
         // Skip for CJK text — CJK languages don't use spaces between words.
-        //
-        // Use a very tight gap threshold (0.01 = 0.12pt for 12pt font) to only
-        // catch truly-touching CID items (gap ≈ 0.0). Type1 font fragments have
-        // gaps of 0.2-0.5pt from positioning imprecision and should NOT trigger this.
-        //
-        // Also skip if the last word of prev or first word of curr is very short
-        // (≤ 2 chars), which indicates a word split across text operators.
         let prev_chars = prev_item.text.trim().chars().count();
         let curr_chars = curr_item.text.trim().chars().count();
         let prev_last_char = prev_item.text.trim().chars().last();
@@ -709,38 +709,16 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
         let is_cjk =
             prev_last_char.is_some_and(is_cjk_char) || curr_first_char.is_some_and(is_cjk_char);
 
-        if !is_cjk && gap >= 0.0 && gap < font_size * 0.01 && prev_chars >= 3 && curr_chars >= 2 {
-            // Count words in the prev item to distinguish line-level vs word-level
-            // text operators. Line-level operators (Type1 fonts) emit long phrases
-            // like "should specifi" that get split mid-word at operator boundaries.
-            // Word-level operators (CID fonts like C2_0) emit single words.
+        if !is_cjk && gap >= 0.0 && gap < font_size * 0.01 && is_cid_font(&prev_item.font) {
             let prev_word_count = prev_item.text.split_whitespace().count();
 
             if prev_word_count >= 3 {
-                // Multi-word phrase (3+ words) from a line-level operator.
-                // The boundary is likely mid-word, not a word boundary.
+                // Multi-word phrase from a line-level CID operator — likely mid-word boundary
                 return gap < font_size * 0.15;
             }
 
-            // Prev is a short item (1-2 words), typical of CID fonts.
-            // Additional safety: skip if last word of prev or first word of curr
-            // is very short (≤ 2 chars), indicating a split word.
-            let prev_trimmed = prev_item.text.trim_end();
-            let last_word_len = prev_trimmed
-                .rsplit(|c: char| c.is_whitespace())
-                .next()
-                .map(|w| w.chars().count())
-                .unwrap_or(prev_chars);
-            let curr_trimmed = curr_item.text.trim_start();
-            let first_word_len = curr_trimmed
-                .split(|c: char| c.is_whitespace())
-                .next()
-                .map(|w| w.chars().count())
-                .unwrap_or(curr_chars);
-
-            if last_word_len > 2 && first_word_len > 2 {
-                return false; // Don't join — separate words from CID font
-            }
+            // CID font: each text operator is a separate word. Always add space.
+            return false;
         }
 
         // Numeric continuity: digits, commas, periods, and percent signs that
