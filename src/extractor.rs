@@ -753,10 +753,11 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
             return gap < font_size * 0.20;
         }
 
-        // Both single-char: per-glyph positioning. For numeric characters
-        // (digits within "100,000"), use generous threshold. For alphabetic
-        // per-glyph text ("E"+"f"+"f"...), use normal threshold to preserve
-        // word spaces between letters like "e" (end of word) + "D" (start).
+        // Both single-char: per-glyph positioning (character-by-character rendering).
+        // Intra-word gaps are ≈ 0, word boundaries are ≈ 0.15× font_size.
+        // For numeric chars (digits within "100,000"), use generous threshold.
+        // For alphabetic, use tight threshold (0.10) to reliably detect word
+        // boundaries in per-character PDFs like SEC filings.
         if prev_chars == 1 && curr_chars == 1 {
             if let (Some(p), Some(c)) = (prev_last, curr_first) {
                 let p_numeric = p.is_ascii_digit() || matches!(p, ',' | '.' | '%' | '+' | '-');
@@ -765,6 +766,7 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
                     return gap < font_size * 0.25;
                 }
             }
+            return gap < font_size * 0.10;
         }
 
         // With accurate widths, a gap < 15% of font size means glyphs are
@@ -2940,6 +2942,75 @@ mod tests {
         let lines = group_into_lines(items);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "NAV");
+    }
+
+    #[test]
+    fn test_per_glyph_word_boundaries() {
+        // Per-character PDF rendering (e.g. SEC filings): each glyph is a
+        // separate TextItem. Intra-word gaps are ≈ 0, word gaps ≈ 2.0 at
+        // font_size 13.3 (ratio 0.15). Must detect word boundaries correctly.
+        fn char_item(ch: &str, x: f32, width: f32) -> TextItem {
+            TextItem {
+                text: ch.into(),
+                x,
+                y: 719.3,
+                width,
+                height: 13.3,
+                font: "F4".into(),
+                font_size: 13.3,
+                page: 1,
+                is_bold: true,
+                is_italic: false,
+                item_type: ItemType::Text,
+            }
+        }
+
+        // "Item 2" — gap of 2.0 between 'm' and '2' at font_size 13.3
+        let items = vec![
+            char_item("I", 24.3, 3.1),
+            char_item("t", 27.5, 2.7),
+            char_item("e", 30.1, 3.5),
+            char_item("m", 33.7, 6.7),
+            char_item("2", 42.3, 4.0), // gap = 42.3 - 40.4 = 1.9
+        ];
+
+        let lines = group_into_lines(items);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Item 2");
+    }
+
+    #[test]
+    fn test_per_glyph_words_not_merged() {
+        // Verify multiple words from per-character rendering get spaces between them
+        fn char_item(ch: &str, x: f32, width: f32) -> TextItem {
+            TextItem {
+                text: ch.into(),
+                x,
+                y: 705.5,
+                width,
+                height: 13.3,
+                font: "F5".into(),
+                font_size: 13.3,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            }
+        }
+
+        // "of the" — three words, each with ~2px word gaps
+        let items = vec![
+            char_item("o", 100.0, 4.0),
+            char_item("f", 104.0, 2.7),
+            // word gap: 108.7 → 110.7 (gap = 4.0)
+            char_item("t", 110.7, 2.7),
+            char_item("h", 113.4, 4.4),
+            char_item("e", 117.8, 3.5),
+        ];
+
+        let lines = group_into_lines(items);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "of the");
     }
 
     #[test]
