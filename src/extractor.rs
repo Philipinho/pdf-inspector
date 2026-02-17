@@ -1079,7 +1079,8 @@ fn extract_page_text_items(
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut fill_is_white = false; // Fill color is white (invisible text)
-    let mut gstate_stack: Vec<([f32; 6], bool)> = Vec::new();
+    let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
+    let mut gstate_stack: Vec<([f32; 6], bool, i32)> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
@@ -1089,17 +1090,23 @@ fn extract_page_text_items(
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
 
+    // Marked content (ActualText) tracking
+    let mut marked_content_stack: Vec<Option<String>> = Vec::new();
+    let mut suppress_glyph_extraction = false;
+    let mut actual_text_emitted = false;
+
     for op in &content.operations {
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
-                gstate_stack.push((ctm, fill_is_white));
+                gstate_stack.push((ctm, fill_is_white, text_rendering_mode));
             }
             "Q" => {
                 // Restore graphics state
-                if let Some((saved_ctm, saved_fill)) = gstate_stack.pop() {
+                if let Some((saved_ctm, saved_fill, saved_tr)) = gstate_stack.pop() {
                     ctm = saved_ctm;
                     fill_is_white = saved_fill;
+                    text_rendering_mode = saved_tr;
                 }
             }
             "cm" => {
@@ -1146,6 +1153,7 @@ fn extract_page_text_items(
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                text_rendering_mode = 0;
             }
             "ET" => {
                 // End text block
@@ -1168,6 +1176,12 @@ fn extract_page_text_items(
                 // Set text leading (used by T*, ', and " operators)
                 if let Some(tl) = op.operands.first().and_then(get_number) {
                     text_leading = tl;
+                }
+            }
+            "Tr" => {
+                // Set text rendering mode (3 = invisible / OCR overlay)
+                if let Some(mode) = op.operands.first().and_then(get_number) {
+                    text_rendering_mode = mode as i32;
                 }
             }
             "Td" | "TD" => {
@@ -1208,18 +1222,50 @@ fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
-                    // Skip invisible (white) text but still advance text matrix
-                    if fill_is_white {
-                        if let Some(font_info) = font_widths.get(&current_font) {
-                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
-                                let w_ts = compute_string_width_ts(
-                                    raw_bytes,
-                                    font_info,
-                                    current_font_size,
-                                );
-                                text_matrix[4] += w_ts * text_matrix[0];
-                                text_matrix[5] += w_ts * text_matrix[1];
+                    // Advance text matrix regardless of visibility
+                    let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
+                        get_operand_bytes(&op.operands[0])
+                            .map(|raw| compute_string_width_ts(raw, fi, current_font_size))
+                    });
+                    // ActualText: emit replacement text once, then suppress glyphs
+                    if suppress_glyph_extraction {
+                        if !actual_text_emitted {
+                            if let Some(at) = marked_content_stack.iter().rev().flatten().next() {
+                                let rendered_size =
+                                    effective_font_size(current_font_size, &text_matrix);
+                                let combined = multiply_matrices(&text_matrix, &ctm);
+                                let base_font = font_base_names
+                                    .get(&current_font)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&current_font);
+                                items.push(TextItem {
+                                    text: at.clone(),
+                                    x: combined[4],
+                                    y: combined[5],
+                                    width: 0.0,
+                                    height: rendered_size,
+                                    font: current_font.clone(),
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: is_bold_font(base_font),
+                                    is_italic: is_italic_font(base_font),
+                                    item_type: ItemType::Text,
+                                });
                             }
+                            actual_text_emitted = true;
+                        }
+                        // Still advance text matrix
+                        if let Some(w_ts) = w_ts_opt {
+                            text_matrix[4] += w_ts * text_matrix[0];
+                            text_matrix[5] += w_ts * text_matrix[1];
+                        }
+                        continue;
+                    }
+                    // Skip invisible (white/Tr=3) text but still advance text matrix
+                    if fill_is_white || text_rendering_mode == 3 {
+                        if let Some(w_ts) = w_ts_opt {
+                            text_matrix[4] += w_ts * text_matrix[0];
+                            text_matrix[5] += w_ts * text_matrix[1];
                         }
                         continue;
                     }
@@ -1235,19 +1281,10 @@ fn extract_page_text_items(
                         let rendered_size = effective_font_size(current_font_size, &text_matrix);
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let (x, y) = (combined[4], combined[5]);
-                        let width = if let Some(font_info) = font_widths.get(&current_font) {
-                            if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
-                                let w_ts = compute_string_width_ts(
-                                    raw_bytes,
-                                    font_info,
-                                    current_font_size,
-                                );
-                                text_matrix[4] += w_ts * text_matrix[0];
-                                text_matrix[5] += w_ts * text_matrix[1];
-                                (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
-                            } else {
-                                0.0
-                            }
+                        let width = if let Some(w_ts) = w_ts_opt {
+                            text_matrix[4] += w_ts * text_matrix[0];
+                            text_matrix[5] += w_ts * text_matrix[1];
+                            (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
                         } else {
                             0.0
                         };
@@ -1280,6 +1317,35 @@ fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
+                        let is_invisible =
+                            fill_is_white || text_rendering_mode == 3 || suppress_glyph_extraction;
+
+                        // Emit ActualText once for the entire TJ array
+                        if suppress_glyph_extraction && !actual_text_emitted {
+                            if let Some(at) = marked_content_stack.iter().rev().flatten().next() {
+                                let rendered_size =
+                                    effective_font_size(current_font_size, &text_matrix);
+                                let combined = multiply_matrices(&text_matrix, &ctm);
+                                let base_font = font_base_names
+                                    .get(&current_font)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&current_font);
+                                items.push(TextItem {
+                                    text: at.clone(),
+                                    x: combined[4],
+                                    y: combined[5],
+                                    width: 0.0,
+                                    height: rendered_size,
+                                    font: current_font.clone(),
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: is_bold_font(base_font),
+                                    is_italic: is_italic_font(base_font),
+                                    item_type: ItemType::Text,
+                                });
+                            }
+                            actual_text_emitted = true;
+                        }
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -1302,7 +1368,7 @@ fn extract_page_text_items(
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
                                     let displacement = -n_val / 1000.0 * current_font_size;
-                                    if !fill_is_white
+                                    if !is_invisible
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
                                     {
@@ -1316,7 +1382,7 @@ fn extract_page_text_items(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
-                                        if !fill_is_white
+                                        if !is_invisible
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
@@ -1329,7 +1395,7 @@ fn extract_page_text_items(
                                 Object::Real(n) => {
                                     let n_val = *n;
                                     let displacement = -n_val / 1000.0 * current_font_size;
-                                    if !fill_is_white
+                                    if !is_invisible
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
                                     {
@@ -1342,7 +1408,7 @@ fn extract_page_text_items(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
-                                        if !fill_is_white
+                                        if !is_invisible
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
@@ -1360,7 +1426,7 @@ fn extract_page_text_items(
                                         compute_string_width_ts(raw_bytes, fi, current_font_size);
                                 }
                             }
-                            if !fill_is_white {
+                            if !is_invisible {
                                 if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
@@ -1375,7 +1441,7 @@ fn extract_page_text_items(
                             }
                         }
                         // Flush remaining text
-                        if !fill_is_white && !current_text.trim().is_empty() {
+                        if !is_invisible && !current_text.trim().is_empty() {
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
                         }
                         // Emit one TextItem per sub-item
@@ -1436,7 +1502,34 @@ fn extract_page_text_items(
                 line_matrix[4] += (-tl) * line_matrix[2];
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
-                if !fill_is_white && !op.operands.is_empty() {
+                if suppress_glyph_extraction && !actual_text_emitted {
+                    if let Some(at) = marked_content_stack.iter().rev().flatten().next() {
+                        let rendered_size = effective_font_size(current_font_size, &text_matrix);
+                        let combined = multiply_matrices(&text_matrix, &ctm);
+                        let base_font = font_base_names
+                            .get(&current_font)
+                            .map(|s| s.as_str())
+                            .unwrap_or(&current_font);
+                        items.push(TextItem {
+                            text: at.clone(),
+                            x: combined[4],
+                            y: combined[5],
+                            width: 0.0,
+                            height: rendered_size,
+                            font: current_font.clone(),
+                            font_size: rendered_size,
+                            page: page_num,
+                            is_bold: is_bold_font(base_font),
+                            is_italic: is_italic_font(base_font),
+                            item_type: ItemType::Text,
+                        });
+                    }
+                    actual_text_emitted = true;
+                } else if !(fill_is_white
+                    || text_rendering_mode == 3
+                    || suppress_glyph_extraction
+                    || op.operands.is_empty())
+                {
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
                         &current_font,
@@ -1481,25 +1574,7 @@ fn extract_page_text_items(
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
                             match xobj_type {
                                 XObjectType::Image => {
-                                    // Get position from CTM
-                                    let (x, y) = (ctm[4], ctm[5]);
-                                    // Get dimensions from CTM scale factors
-                                    let width = ctm[0].abs();
-                                    let height = ctm[3].abs();
-
-                                    items.push(TextItem {
-                                        text: format!("[Image: {}]", xobj_name),
-                                        x,
-                                        y,
-                                        width,
-                                        height,
-                                        font: String::new(),
-                                        font_size: 0.0,
-                                        page: page_num,
-                                        is_bold: false,
-                                        is_italic: false,
-                                        item_type: ItemType::Image,
-                                    });
+                                    // Skip images — text extraction only
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
@@ -1513,11 +1588,140 @@ fn extract_page_text_items(
                     }
                 }
             }
+            "BMC" => {
+                // Begin Marked Content (no properties)
+                marked_content_stack.push(None);
+            }
+            "BDC" => {
+                // Begin Marked Content with properties — extract ActualText
+                let mut actual_text: Option<String> = None;
+                if op.operands.len() >= 2 {
+                    let dict = match &op.operands[1] {
+                        Object::Dictionary(d) => Some(d.clone()),
+                        Object::Reference(id) => doc.get_dictionary(*id).ok().cloned(),
+                        _ => None,
+                    };
+                    if let Some(d) = dict {
+                        if let Ok(val) = d.get(b"ActualText") {
+                            actual_text = match val {
+                                Object::String(bytes, _) => Some(decode_text_string(bytes)),
+                                _ => None,
+                            };
+                        }
+                    }
+                }
+                if actual_text.is_some() {
+                    suppress_glyph_extraction = true;
+                    actual_text_emitted = false;
+                }
+                marked_content_stack.push(actual_text);
+            }
+            "EMC" => {
+                // End Marked Content
+                if let Some(popped) = marked_content_stack.pop() {
+                    if popped.is_some() {
+                        suppress_glyph_extraction =
+                            marked_content_stack.iter().any(|a| a.is_some());
+                        actual_text_emitted = false;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    let items = merge_text_items(items);
     Ok(items)
+}
+
+/// Merge adjacent single-character TextItems into words.
+///
+/// Per-character PDFs (e.g. SEC filings) produce hundreds of single-char items.
+/// This merges items on the same line that are close together into words,
+/// inserting spaces at word boundaries.
+fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    if items.is_empty() {
+        return items;
+    }
+
+    // Group items by (page, Y position) with 5pt tolerance
+    let y_tolerance = 5.0;
+    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+
+    for item in &items {
+        let found = line_groups
+            .iter_mut()
+            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
+        if let Some((_, _, group)) = found {
+            group.push(item);
+        } else {
+            line_groups.push((item.page, item.y, vec![item]));
+        }
+    }
+
+    // Sort each group by X position
+    for (_, _, group) in &mut line_groups {
+        group.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // Sort groups by page then Y descending (top of page first)
+    line_groups.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut merged = Vec::new();
+
+    for (_, _, group) in &line_groups {
+        let mut i = 0;
+        while i < group.len() {
+            let first = group[i];
+            let mut text = first.text.clone();
+            let mut end_x = first.x + first.width;
+            let x_gap_max = first.font_size * 0.5;
+
+            let mut j = i + 1;
+            while j < group.len() {
+                let next = group[j];
+                // Must be similar font size (within 20%)
+                if (next.font_size - first.font_size).abs() > first.font_size * 0.20 {
+                    break;
+                }
+                let gap = next.x - end_x;
+                if gap > x_gap_max {
+                    break;
+                }
+                if gap < -first.font_size * 0.5 {
+                    break;
+                }
+                // Insert space at word boundaries
+                if gap > first.font_size * 0.08 {
+                    text.push(' ');
+                }
+                text.push_str(&next.text);
+                end_x = next.x + next.width;
+                j += 1;
+            }
+
+            merged.push(TextItem {
+                text,
+                x: first.x,
+                y: first.y,
+                width: end_x - first.x,
+                height: first.height,
+                font: first.font.clone(),
+                font_size: first.font_size,
+                page: first.page,
+                is_bold: first.is_bold,
+                is_italic: first.is_italic,
+                item_type: first.item_type.clone(),
+            });
+
+            i = j;
+        }
+    }
+
+    merged
 }
 
 /// Helper to get f32 from Object
@@ -2266,6 +2470,22 @@ fn extract_text_from_operand(
         Some(bytes.iter().map(|&b| b as char).collect())
     } else {
         None
+    }
+}
+
+/// Decode a PDF text string (ActualText, etc.) that may be UTF-16BE (BOM \xFE\xFF)
+/// or PDFDocEncoding (Latin-1 superset).
+fn decode_text_string(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        // UTF-16BE with BOM
+        let utf16: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else {
+        // PDFDocEncoding — identical to Latin-1 for the byte range we care about
+        bytes.iter().map(|&b| b as char).collect()
     }
 }
 
