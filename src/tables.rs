@@ -1175,11 +1175,18 @@ fn find_first_table_row(
         let fill_ratio = filled_count as f32 / total_cols as f32;
 
         // Check for form-like patterns (cells with colons)
-        let has_form_patterns = filled_cells.iter().any(|c| {
-            let text = c.trim();
-            (text.ends_with(':') && text.len() > 1)
-                || (text.contains(": ") && !looks_like_number(text))
-        });
+        // Only treat as form row if most filled cells look form-like,
+        // or the row is very sparse with any form pattern.
+        let form_cell_count = filled_cells
+            .iter()
+            .filter(|c| {
+                let text = c.trim();
+                (text.ends_with(':') && text.len() > 1)
+                    || (text.contains(": ") && !looks_like_number(text))
+            })
+            .count();
+        let has_form_patterns =
+            form_cell_count > 0 && (form_cell_count * 2 >= filled_count || fill_ratio < 0.3);
 
         // Check for numeric content
         let numeric_count = filled_cells

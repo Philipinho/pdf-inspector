@@ -1190,7 +1190,7 @@ fn extract_page_text_items(
                 }
             }
             "TJ" => {
-                // Show text with positioning
+                // Show text with positioning — split at column-sized gaps
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
@@ -1203,31 +1203,66 @@ fn extract_page_text_items(
                         } else {
                             120.0
                         };
+                        let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut combined_text = String::new();
+                        // Track sub-items for column-gap splitting:
+                        // (text, start_width_ts, end_width_ts)
+                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        let mut current_text = String::new();
+                        let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         for element in array {
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    total_width_ts += -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size;
                                     if !fill_is_white
-                                        && n_val < -space_threshold
-                                        && !combined_text.is_empty()
-                                        && !combined_text.ends_with(' ')
+                                        && n_val < -column_gap_threshold
+                                        && !current_text.is_empty()
                                     {
-                                        combined_text.push(' ');
+                                        // Column gap: flush current segment
+                                        sub_items.push((
+                                            std::mem::take(&mut current_text),
+                                            sub_start_width_ts,
+                                            total_width_ts,
+                                        ));
+                                        total_width_ts += displacement;
+                                        sub_start_width_ts = total_width_ts;
+                                    } else {
+                                        total_width_ts += displacement;
+                                        if !fill_is_white
+                                            && n_val < -space_threshold
+                                            && !current_text.is_empty()
+                                            && !current_text.ends_with(' ')
+                                        {
+                                            current_text.push(' ');
+                                        }
                                     }
                                     continue;
                                 }
                                 Object::Real(n) => {
-                                    total_width_ts += -(*n) / 1000.0 * current_font_size;
+                                    let n_val = *n;
+                                    let displacement = -n_val / 1000.0 * current_font_size;
                                     if !fill_is_white
-                                        && *n < -space_threshold
-                                        && !combined_text.is_empty()
-                                        && !combined_text.ends_with(' ')
+                                        && n_val < -column_gap_threshold
+                                        && !current_text.is_empty()
                                     {
-                                        combined_text.push(' ');
+                                        sub_items.push((
+                                            std::mem::take(&mut current_text),
+                                            sub_start_width_ts,
+                                            total_width_ts,
+                                        ));
+                                        total_width_ts += displacement;
+                                        sub_start_width_ts = total_width_ts;
+                                    } else {
+                                        total_width_ts += displacement;
+                                        if !fill_is_white
+                                            && n_val < -space_threshold
+                                            && !current_text.is_empty()
+                                            && !current_text.ends_with(' ')
+                                        {
+                                            current_text.push(' ');
+                                        }
                                     }
                                     continue;
                                 }
@@ -1249,39 +1284,53 @@ fn extract_page_text_items(
                                     &font_encodings,
                                     &encoding_cache,
                                 ) {
-                                    combined_text.push_str(&text);
+                                    current_text.push_str(&text);
                                 }
                             }
                         }
-                        if !fill_is_white && !combined_text.trim().is_empty() {
+                        // Flush remaining text
+                        if !fill_is_white && !current_text.trim().is_empty() {
+                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                        }
+                        // Emit one TextItem per sub-item
+                        if !sub_items.is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            let combined = multiply_matrices(&text_matrix, &ctm);
-                            let (x, y) = (combined[4], combined[5]);
-                            let width = if font_info.is_some() {
-                                (total_width_ts
-                                    * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
-                                    .abs()
-                            } else {
-                                0.0
-                            };
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            items.push(TextItem {
-                                text: expand_ligatures(&combined_text),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
-                                font: current_font.clone(),
-                                font_size: rendered_size,
-                                page: page_num,
-                                is_bold: is_bold_font(base_font),
-                                is_italic: is_italic_font(base_font),
-                                item_type: ItemType::Text,
-                            });
+                            let scale_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
+                            for (text, start_w, end_w) in &sub_items {
+                                let offset_tm = [
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + start_w * text_matrix[0],
+                                    text_matrix[5] + start_w * text_matrix[1],
+                                ];
+                                let combined = multiply_matrices(&offset_tm, &ctm);
+                                let (x, y) = (combined[4], combined[5]);
+                                let width = if font_info.is_some() {
+                                    ((end_w - start_w) * scale_x).abs()
+                                } else {
+                                    0.0
+                                };
+                                items.push(TextItem {
+                                    text: expand_ligatures(text),
+                                    x,
+                                    y,
+                                    width,
+                                    height: rendered_size,
+                                    font: current_font.clone(),
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: is_bold_font(base_font),
+                                    is_italic: is_italic_font(base_font),
+                                    item_type: ItemType::Text,
+                                });
+                            }
                         }
                         // Always advance text matrix by total width
                         if font_info.is_some() {
@@ -1656,6 +1705,7 @@ fn extract_form_xobject_text(
                 }
             }
             "TJ" => {
+                // Show text with positioning — split at column-sized gaps
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
@@ -1667,31 +1717,63 @@ fn extract_form_xobject_text(
                         } else {
                             120.0
                         };
+                        let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut combined_text = String::new();
+                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        let mut current_text = String::new();
+                        let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         for element in array {
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    total_width_ts += -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size;
                                     if !fill_is_white
-                                        && n_val < -space_threshold
-                                        && !combined_text.is_empty()
-                                        && !combined_text.ends_with(' ')
+                                        && n_val < -column_gap_threshold
+                                        && !current_text.is_empty()
                                     {
-                                        combined_text.push(' ');
+                                        sub_items.push((
+                                            std::mem::take(&mut current_text),
+                                            sub_start_width_ts,
+                                            total_width_ts,
+                                        ));
+                                        total_width_ts += displacement;
+                                        sub_start_width_ts = total_width_ts;
+                                    } else {
+                                        total_width_ts += displacement;
+                                        if !fill_is_white
+                                            && n_val < -space_threshold
+                                            && !current_text.is_empty()
+                                            && !current_text.ends_with(' ')
+                                        {
+                                            current_text.push(' ');
+                                        }
                                     }
                                     continue;
                                 }
                                 Object::Real(n) => {
-                                    total_width_ts += -(*n) / 1000.0 * current_font_size;
+                                    let n_val = *n;
+                                    let displacement = -n_val / 1000.0 * current_font_size;
                                     if !fill_is_white
-                                        && *n < -space_threshold
-                                        && !combined_text.is_empty()
-                                        && !combined_text.ends_with(' ')
+                                        && n_val < -column_gap_threshold
+                                        && !current_text.is_empty()
                                     {
-                                        combined_text.push(' ');
+                                        sub_items.push((
+                                            std::mem::take(&mut current_text),
+                                            sub_start_width_ts,
+                                            total_width_ts,
+                                        ));
+                                        total_width_ts += displacement;
+                                        sub_start_width_ts = total_width_ts;
+                                    } else {
+                                        total_width_ts += displacement;
+                                        if !fill_is_white
+                                            && n_val < -space_threshold
+                                            && !current_text.is_empty()
+                                            && !current_text.ends_with(' ')
+                                        {
+                                            current_text.push(' ');
+                                        }
                                     }
                                     continue;
                                 }
@@ -1713,40 +1795,52 @@ fn extract_form_xobject_text(
                                     &font_encodings,
                                     &encoding_cache,
                                 ) {
-                                    combined_text.push_str(&text);
+                                    current_text.push_str(&text);
                                 }
                             }
                         }
-                        if !fill_is_white && !combined_text.trim().is_empty() {
+                        if !fill_is_white && !current_text.trim().is_empty() {
+                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                        }
+                        if !sub_items.is_empty() {
                             let rendered_size =
                                 effective_font_size(current_font_size, &text_matrix);
-                            let combined_mat = multiply_matrices(&text_matrix, parent_ctm);
-                            let (x, y) = (combined_mat[4], combined_mat[5]);
-                            let width = if font_info.is_some() {
-                                (total_width_ts
-                                    * (text_matrix[0] * parent_ctm[0]
-                                        + text_matrix[1] * parent_ctm[2]))
-                                    .abs()
-                            } else {
-                                0.0
-                            };
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            items.push(TextItem {
-                                text: expand_ligatures(&combined_text),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
-                                font: current_font.clone(),
-                                font_size: rendered_size,
-                                page: page_num,
-                                is_bold: is_bold_font(base_font),
-                                is_italic: is_italic_font(base_font),
-                                item_type: ItemType::Text,
-                            });
+                            let scale_x =
+                                text_matrix[0] * parent_ctm[0] + text_matrix[1] * parent_ctm[2];
+                            for (text, start_w, end_w) in &sub_items {
+                                let offset_tm = [
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + start_w * text_matrix[0],
+                                    text_matrix[5] + start_w * text_matrix[1],
+                                ];
+                                let combined_mat = multiply_matrices(&offset_tm, parent_ctm);
+                                let (x, y) = (combined_mat[4], combined_mat[5]);
+                                let width = if font_info.is_some() {
+                                    ((end_w - start_w) * scale_x).abs()
+                                } else {
+                                    0.0
+                                };
+                                items.push(TextItem {
+                                    text: expand_ligatures(text),
+                                    x,
+                                    y,
+                                    width,
+                                    height: rendered_size,
+                                    font: current_font.clone(),
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: is_bold_font(base_font),
+                                    is_italic: is_italic_font(base_font),
+                                    item_type: ItemType::Text,
+                                });
+                            }
                         }
                         // Always advance text matrix
                         if font_info.is_some() {
