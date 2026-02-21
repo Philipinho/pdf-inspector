@@ -564,6 +564,11 @@ pub(crate) fn parse_encoding_dictionary(
                 }
                 if let Some(ch) = glyph_to_char(&glyph_name) {
                     encoding_map.insert(current_code, ch);
+                } else {
+                    debug!(
+                        "  Differences: code=0x{:02X} glyph={:?} (unmapped)",
+                        current_code, glyph_name
+                    );
                 }
                 current_code = current_code.wrapping_add(1);
             }
