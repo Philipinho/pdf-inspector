@@ -1233,9 +1233,9 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("afii61248", '℅');
     m.insert("afii61289", 'ℓ');
     m.insert("afii61352", '№');
-    m.insert("afii61573", '‬');
-    m.insert("afii61574", '‭');
-    m.insert("afii61575", '‮');
+    m.insert("afii61573", '\u{202C}');
+    m.insert("afii61574", '\u{202D}');
+    m.insert("afii61575", '\u{202E}');
     m.insert("afii61664", '‌');
     m.insert("afii63167", '٭');
     m.insert("afii64937", 'ʽ');
@@ -3702,7 +3702,7 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("seventeenparen", '⒄');
     m.insert("seventeenperiod", '⒘');
     m.insert("seventhai", '๗');
-    m.insert("sfthyphen", '­');
+    m.insert("sfthyphen", '\u{00AD}');
     m.insert("shaarmenian", 'շ');
     m.insert("shabengali", 'শ');
     m.insert("shacyrillic", 'ш');
@@ -3810,7 +3810,7 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("smileface", '☺');
     m.insert("smonospace", 'ｓ');
     m.insert("sofpasuqhebrew", '׃');
-    m.insert("softhyphen", '­');
+    m.insert("softhyphen", '\u{00AD}');
     m.insert("softsigncyrillic", 'ь');
     m.insert("sohiragana", 'そ');
     m.insert("sokatakana", 'ソ');
@@ -4516,7 +4516,7 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("zerothai", '๐');
     m.insert("zerowidthjoiner", '﻿');
     m.insert("zerowidthnonjoiner", '‌');
-    m.insert("zerowidthspace", '​');
+    m.insert("zerowidthspace", '\u{200B}');
     m.insert("zeta", 'ζ');
     m.insert("zhbopomofo", 'ㄓ');
     m.insert("zhearmenian", 'ժ');
