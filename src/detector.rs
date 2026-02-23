@@ -98,11 +98,23 @@ pub fn detect_pdf_type_with_config<P: AsRef<Path>>(
     crate::validate_pdf_file(&path)?;
 
     // First, load metadata only (fast operation)
-    let metadata = Document::load_metadata(&path)?;
+    let metadata = match Document::load_metadata(&path) {
+        Ok(m) => m,
+        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
+            Document::load_metadata_with_password(&path, "")?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Then load the full document for content inspection
     // We use filtered loading to skip heavy objects we don't need
-    let doc = Document::load(&path)?;
+    let doc = match Document::load(&path) {
+        Ok(d) => d,
+        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
+            Document::load_with_password(&path, "")?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     detect_from_document(&doc, metadata.page_count, &config)
 }
@@ -120,10 +132,22 @@ pub fn detect_pdf_type_mem_with_config(
     crate::validate_pdf_bytes(buffer)?;
 
     // Load metadata first (fast)
-    let metadata = Document::load_metadata_mem(buffer)?;
+    let metadata = match Document::load_metadata_mem(buffer) {
+        Ok(m) => m,
+        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
+            Document::load_metadata_mem_with_password(buffer, "")?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Load document for inspection
-    let doc = Document::load_mem(buffer)?;
+    let doc = match Document::load_mem(buffer) {
+        Ok(d) => d,
+        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
+            Document::load_mem_with_password(buffer, "")?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     detect_from_document(&doc, metadata.page_count, &config)
 }

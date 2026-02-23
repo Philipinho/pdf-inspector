@@ -500,6 +500,7 @@ impl From<lopdf::Error> for PdfError {
             | lopdf::Error::InvalidPassword
             | lopdf::Error::AlreadyEncrypted
             | lopdf::Error::UnsupportedSecurityHandler(_) => PdfError::Encrypted,
+            lopdf::Error::Unimplemented(msg) if msg.contains("encrypted") => PdfError::Encrypted,
             lopdf::Error::Parse(ref pe) if pe.to_string().contains("invalid file header") => {
                 PdfError::NotAPdf("invalid PDF file header".to_string())
             }
@@ -512,6 +513,17 @@ impl From<lopdf::Error> for PdfError {
             other => PdfError::Parse(other.to_string()),
         }
     }
+}
+
+/// Check whether a `lopdf::Error` represents an encryption-related failure.
+pub(crate) fn is_encrypted_lopdf_error(e: &lopdf::Error) -> bool {
+    matches!(
+        e,
+        lopdf::Error::Decryption(_)
+            | lopdf::Error::InvalidPassword
+            | lopdf::Error::AlreadyEncrypted
+            | lopdf::Error::UnsupportedSecurityHandler(_)
+    ) || matches!(e, lopdf::Error::Unimplemented(msg) if msg.contains("encrypted"))
 }
 
 // ---------------------------------------------------------------------------
