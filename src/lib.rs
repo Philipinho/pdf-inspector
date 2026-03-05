@@ -430,21 +430,74 @@ fn compute_layout_complexity(
     rects: &[types::PdfRect],
     lines: &[types::PdfLine],
 ) -> LayoutComplexity {
+    use markdown::analysis::calculate_font_stats_from_items;
+
     // --- Collect unique pages ---
     let mut seen_pages: Vec<u32> = items.iter().map(|i| i.page).collect();
     seen_pages.sort();
     seen_pages.dedup();
 
-    // --- Tables: use rect-based then line-based detectors per page ---
+    let font_stats = calculate_font_stats_from_items(items);
+    let base_size = font_stats.most_common_size;
+
+    // --- Tables: use rect-based → line-based → heuristic detectors per page,
+    //     with side-by-side band splitting ---
     let mut pages_with_tables: Vec<u32> = Vec::new();
     for &page in &seen_pages {
-        let (tables, _) = tables::detect_tables_from_rects(items, rects, page);
-        if !tables.is_empty() {
-            pages_with_tables.push(page);
-            continue;
+        let page_items: Vec<&types::TextItem> = items.iter().filter(|i| i.page == page).collect();
+
+        // Check for side-by-side layout
+        let owned_items: Vec<types::TextItem> = page_items.iter().map(|i| (*i).clone()).collect();
+        let bands = markdown::split_side_by_side(&owned_items);
+
+        let band_ranges: Vec<(f32, f32)> = if bands.is_empty() {
+            // Single region — use sentinel range that includes everything
+            vec![(f32::MIN, f32::MAX)]
+        } else {
+            bands
+        };
+
+        let mut found_table = false;
+        for &(x_lo, x_hi) in &band_ranges {
+            let margin = 2.0;
+            let band_items: Vec<types::TextItem> = owned_items
+                .iter()
+                .filter(|item| {
+                    x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin)
+                })
+                .cloned()
+                .collect();
+
+            let band_rects: Vec<types::PdfRect> = if x_lo == f32::MIN {
+                rects.iter().filter(|r| r.page == page).cloned().collect()
+            } else {
+                markdown::filter_rects_to_band(rects, page, x_lo, x_hi)
+            };
+
+            let band_lines: Vec<types::PdfLine> = if x_lo == f32::MIN {
+                lines.iter().filter(|l| l.page == page).cloned().collect()
+            } else {
+                markdown::filter_lines_to_band(lines, page, x_lo, x_hi)
+            };
+
+            let (rect_tables, _) = tables::detect_tables_from_rects(&band_items, &band_rects, page);
+            if !rect_tables.is_empty() {
+                found_table = true;
+                break;
+            }
+            let line_tables = tables::detect_tables_from_lines(&band_items, &band_lines, page);
+            if !line_tables.is_empty() {
+                found_table = true;
+                break;
+            }
+            // Heuristic fallback for borderless tables
+            let heuristic_tables = tables::detect_tables(&band_items, base_size, false);
+            if !heuristic_tables.is_empty() {
+                found_table = true;
+                break;
+            }
         }
-        let line_tables = tables::detect_tables_from_lines(items, lines, page);
-        if !line_tables.is_empty() {
+        if found_table {
             pages_with_tables.push(page);
         }
     }

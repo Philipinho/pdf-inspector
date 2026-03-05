@@ -6,7 +6,7 @@
 //! - Code blocks (monospace fonts, indentation)
 //! - Paragraphs
 
-mod analysis;
+pub(crate) mod analysis;
 mod classify;
 mod convert;
 mod postprocess;
@@ -17,11 +17,126 @@ pub use convert::to_markdown_from_lines;
 use std::collections::{HashMap, HashSet};
 
 use crate::extractor::group_into_lines;
-use crate::types::TextItem;
+use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
 use classify::{format_list_item, is_code_like, is_list_item};
 use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_images};
+
+/// Detect side-by-side table layout by finding a significant X-position gap.
+///
+/// Returns X-band boundaries `[(x_min, split_x), (split_x, x_max)]` when a
+/// clear vertical gap separates two groups of items, or an empty vec if the
+/// page has a single-region layout.
+///
+/// Evaluates all candidate gaps (≥40pt with ≥20 items on each side) and picks
+/// the one with the fewest bounding-box crossings. The crossing count must be
+/// under 2% of total items — this prevents splitting paragraphs whose lines
+/// extend across the gap.
+pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
+    if items.len() < 40 {
+        return vec![];
+    }
+
+    // Sort items by left edge
+    let mut xs: Vec<f32> = items.iter().map(|i| i.x).collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find all candidate gaps: ≥40pt with ≥20 items on each side
+    let mut candidates: Vec<(f32, usize)> = Vec::new(); // (split_x, gap_pos)
+    for i in 1..xs.len() {
+        let gap = xs[i] - xs[i - 1];
+        let left_count = i;
+        let right_count = xs.len() - i;
+        if gap >= 40.0 && left_count >= 20 && right_count >= 20 {
+            let split_x = (xs[i - 1] + xs[i]) / 2.0;
+            candidates.push((split_x, i));
+        }
+    }
+
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    // Pick the candidate with the fewest bounding-box crossings,
+    // but only consider balanced splits (smaller side ≥ 30% of total).
+    let min_side = items.len() * 3 / 10;
+    let mut best_split = 0.0f32;
+    let mut best_crossing = usize::MAX;
+    for &(split_x, gap_pos) in &candidates {
+        let left_count = gap_pos;
+        let right_count = xs.len() - gap_pos;
+        if left_count.min(right_count) < min_side {
+            continue;
+        }
+        let crossing = items
+            .iter()
+            .filter(|item| item.x < split_x && (item.x + item.width) > split_x)
+            .count();
+        if crossing < best_crossing {
+            best_crossing = crossing;
+            best_split = split_x;
+        }
+    }
+
+    if best_crossing == usize::MAX {
+        return vec![];
+    }
+
+    // Crossing items must be < 2% of total (allows a few spanning headers)
+    let max_crossing = (items.len() / 50).max(2);
+    if best_crossing > max_crossing {
+        return vec![];
+    }
+
+    let x_min = xs[0];
+    let x_max = *xs.last().unwrap();
+
+    vec![(x_min, best_split), (best_split, x_max)]
+}
+
+/// Filter rects to those overlapping an X band.
+pub(crate) fn filter_rects_to_band(
+    rects: &[PdfRect],
+    page: u32,
+    x_lo: f32,
+    x_hi: f32,
+) -> Vec<PdfRect> {
+    rects
+        .iter()
+        .filter(|r| {
+            r.page == page && {
+                let rx_min = if r.width >= 0.0 { r.x } else { r.x + r.width };
+                let rx_max = if r.width >= 0.0 { r.x + r.width } else { r.x };
+                rx_max > x_lo && rx_min < x_hi
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// A band of items/indices/rects/lines for side-by-side table detection.
+type BandSpec = (Vec<TextItem>, Vec<usize>, Vec<PdfRect>, Vec<PdfLine>);
+
+/// Filter PDF lines to those overlapping an X band.
+pub(crate) fn filter_lines_to_band(
+    lines: &[PdfLine],
+    page: u32,
+    x_lo: f32,
+    x_hi: f32,
+) -> Vec<PdfLine> {
+    lines
+        .iter()
+        .filter(|l| {
+            l.page == page && {
+                let lx_min = l.x1.min(l.x2);
+                let lx_max = l.x1.max(l.x2);
+                lx_max > x_lo && lx_min < x_hi
+            }
+        })
+        .cloned()
+        .collect()
+}
 
 /// Options for markdown conversion
 #[derive(Debug, Clone)]
@@ -230,34 +345,60 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
-        // Track which local indices are claimed by structural table detection
-        let mut rect_claimed: HashSet<usize> = HashSet::new();
+        // Check for side-by-side layout (e.g. two tables placed left and right)
+        let bands = split_side_by_side(&page_items);
 
-        // 1. Rect-based detection first (well-tested, high precision)
-        let (rect_tables, hint_regions) = detect_tables_from_rects(&page_items, rects, page);
-        for table in &rect_tables {
-            for &idx in &table.item_indices {
-                rect_claimed.insert(idx);
-                if let Some(&(global_idx, _)) = group.get(idx) {
-                    table_items.insert(global_idx);
-                }
+        // Build list of (band_items, band_index_map, band_rects, band_lines).
+        // band_index_map[local_band_idx] → page_items index.
+        let band_specs: Vec<BandSpec> = if bands.is_empty() {
+            // Single-region page — use all items/rects/lines as-is
+            let identity: Vec<usize> = (0..page_items.len()).collect();
+            vec![(
+                page_items.clone(),
+                identity,
+                rects.iter().filter(|r| r.page == page).cloned().collect(),
+                pdf_lines
+                    .iter()
+                    .filter(|l| l.page == page)
+                    .cloned()
+                    .collect(),
+            )]
+        } else {
+            bands
+                .iter()
+                .map(|&(x_lo, x_hi)| {
+                    let margin = 2.0; // small margin to avoid clipping edge items
+                    let (items_in_band, idx_map): (Vec<TextItem>, Vec<usize>) = page_items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| item.x >= x_lo - margin && item.x < x_hi + margin)
+                        .map(|(idx, item)| (item.clone(), idx))
+                        .unzip();
+                    let band_rects = filter_rects_to_band(rects, page, x_lo, x_hi);
+                    let band_lines = filter_lines_to_band(pdf_lines, page, x_lo, x_hi);
+                    (items_in_band, idx_map, band_rects, band_lines)
+                })
+                .collect()
+        };
+
+        for (band_items, band_index_map, band_rects, band_lines) in &band_specs {
+            if band_items.is_empty() {
+                continue;
             }
-            let table_y = table.rows.first().copied().unwrap_or(0.0);
-            let table_md = table_to_markdown(table);
-            page_tables
-                .entry(page)
-                .or_default()
-                .push((table_y, table_md));
-        }
 
-        // 2. Line-based detection on unclaimed items (when rects didn't find tables)
-        if rect_claimed.is_empty() {
-            let line_tables = detect_tables_from_lines(&page_items, pdf_lines, page);
-            for table in &line_tables {
+            // Track which band-local indices are claimed by structural detection
+            let mut rect_claimed: HashSet<usize> = HashSet::new();
+
+            // 1. Rect-based detection first (well-tested, high precision)
+            let (rect_tables, hint_regions) =
+                detect_tables_from_rects(band_items, band_rects, page);
+            for table in &rect_tables {
                 for &idx in &table.item_indices {
                     rect_claimed.insert(idx);
-                    if let Some(&(global_idx, _)) = group.get(idx) {
-                        table_items.insert(global_idx);
+                    if let Some(&page_idx) = band_index_map.get(idx) {
+                        if let Some(&(global_idx, _)) = group.get(page_idx) {
+                            table_items.insert(global_idx);
+                        }
                     }
                 }
                 let table_y = table.rows.first().copied().unwrap_or(0.0);
@@ -267,74 +408,94 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .or_default()
                     .push((table_y, table_md));
             }
-        }
 
-        // 3. Heuristic fallback on unclaimed items
-        let mut run_heuristic =
-            |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
-                if subset_items.len() < min_items {
-                    return;
-                }
-                let tables = detect_tables(subset_items, base_size, false);
-                for table in tables {
+            // 2. Line-based detection on unclaimed items (when rects didn't find tables)
+            if rect_claimed.is_empty() {
+                let line_tables = detect_tables_from_lines(band_items, band_lines, page);
+                for table in &line_tables {
                     for &idx in &table.item_indices {
-                        if let Some(&page_idx) = index_map.get(idx) {
+                        rect_claimed.insert(idx);
+                        if let Some(&page_idx) = band_index_map.get(idx) {
                             if let Some(&(global_idx, _)) = group.get(page_idx) {
                                 table_items.insert(global_idx);
                             }
                         }
                     }
                     let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(&table);
+                    let table_md = table_to_markdown(table);
                     page_tables
                         .entry(page)
                         .or_default()
                         .push((table_y, table_md));
                 }
-            };
+            }
 
-        // Run heuristic detection on unclaimed items
-        if rect_claimed.is_empty() && hint_regions.is_empty() {
-            // No rect tables or hints — run heuristic on all items
-            let identity_map: Vec<usize> = (0..page_items.len()).collect();
-            run_heuristic(&page_items, &identity_map, 6);
-        } else if rect_claimed.is_empty() && !hint_regions.is_empty() {
-            // No rect tables but hint regions exist — run heuristic separately
-            // on items inside each hint region and on items outside all hints.
-            // This prevents graph labels from being merged into nearby tables.
-            let padding = 15.0; // include header lines slightly above rects
-            for hint in &hint_regions {
-                let (inside_items, inside_map): (Vec<TextItem>, Vec<usize>) = page_items
+            // 3. Heuristic fallback on unclaimed items
+            let mut run_heuristic =
+                |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
+                    if subset_items.len() < min_items {
+                        return;
+                    }
+                    let tables = detect_tables(subset_items, base_size, false);
+                    for table in tables {
+                        for &idx in &table.item_indices {
+                            if let Some(&band_idx) = index_map.get(idx) {
+                                if let Some(&page_idx) = band_index_map.get(band_idx) {
+                                    if let Some(&(global_idx, _)) = group.get(page_idx) {
+                                        table_items.insert(global_idx);
+                                    }
+                                }
+                            }
+                        }
+                        let table_y = table.rows.first().copied().unwrap_or(0.0);
+                        let table_md = table_to_markdown(&table);
+                        page_tables
+                            .entry(page)
+                            .or_default()
+                            .push((table_y, table_md));
+                    }
+                };
+
+            // Run heuristic detection on unclaimed items
+            if rect_claimed.is_empty() && hint_regions.is_empty() {
+                // No rect tables or hints — run heuristic on all band items
+                let identity_map: Vec<usize> = (0..band_items.len()).collect();
+                run_heuristic(band_items, &identity_map, 6);
+            } else if rect_claimed.is_empty() && !hint_regions.is_empty() {
+                // No rect tables but hint regions exist — run heuristic separately
+                // on items inside each hint region and on items outside all hints.
+                let padding = 15.0;
+                for hint in &hint_regions {
+                    let (inside_items, inside_map): (Vec<TextItem>, Vec<usize>) = band_items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| {
+                            item.y >= hint.y_bottom - padding && item.y <= hint.y_top + padding
+                        })
+                        .map(|(idx, item)| (item.clone(), idx))
+                        .unzip();
+                    run_heuristic(&inside_items, &inside_map, 6);
+                    for &band_idx in &inside_map {
+                        rect_claimed.insert(band_idx);
+                    }
+                }
+                let (outside_items, outside_map): (Vec<TextItem>, Vec<usize>) = band_items
                     .iter()
                     .enumerate()
-                    .filter(|(_, item)| {
-                        item.y >= hint.y_bottom - padding && item.y <= hint.y_top + padding
-                    })
+                    .filter(|(idx, _)| !rect_claimed.contains(idx))
                     .map(|(idx, item)| (item.clone(), idx))
                     .unzip();
-                run_heuristic(&inside_items, &inside_map, 6);
-                // Mark hint-region items as claimed so they aren't re-processed
-                for &page_idx in &inside_map {
-                    rect_claimed.insert(page_idx);
-                }
+                run_heuristic(&outside_items, &outside_map, 6);
+            } else {
+                // Rect tables found — run heuristic on unclaimed items
+                let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = band_items
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !rect_claimed.contains(idx))
+                    .map(|(idx, item)| (item.clone(), idx))
+                    .unzip();
+                run_heuristic(&unclaimed_items, &unclaimed_map, 6);
             }
-            // Run heuristic on remaining items outside all hint regions
-            let (outside_items, outside_map): (Vec<TextItem>, Vec<usize>) = page_items
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| !rect_claimed.contains(idx))
-                .map(|(idx, item)| (item.clone(), idx))
-                .unzip();
-            run_heuristic(&outside_items, &outside_map, 6);
-        } else {
-            // Rect tables found — run heuristic on unclaimed items
-            let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = page_items
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| !rect_claimed.contains(idx))
-                .map(|(idx, item)| (item.clone(), idx))
-                .unzip();
-            run_heuristic(&unclaimed_items, &unclaimed_map, 6);
         }
     }
 
