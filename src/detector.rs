@@ -195,7 +195,12 @@ pub(crate) fn detect_from_document(
         if let Some(&page_id) = pages.get(page_num) {
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
-            if analysis.text_operator_count >= config.min_text_ops_per_page {
+            let is_image_dominated = analysis.image_count > 10
+                && analysis.image_count > analysis.text_operator_count * 3;
+            if analysis.text_operator_count >= config.min_text_ops_per_page
+                && !is_image_dominated
+                && analysis.unique_text_chars >= 5
+            {
                 pages_with_text += 1;
             }
             if analysis.has_images {
@@ -207,10 +212,12 @@ pub(crate) fn detect_from_document(
             total_text_ops += analysis.text_operator_count;
             analysis_cache.insert(*page_num, analysis.clone());
 
-            // Early exit: if this page is non-text (no text ops but has images),
-            // this PDF won't be purely TextBased. Stop scanning remaining pages.
+            // Early exit: if this page is non-text (insufficient meaningful text
+            // but has images), this PDF won't be purely TextBased.
             if allow_early_exit
-                && analysis.text_operator_count < config.min_text_ops_per_page
+                && (analysis.text_operator_count < config.min_text_ops_per_page
+                    || is_image_dominated
+                    || analysis.unique_text_chars < 5)
                 && (analysis.has_images || analysis.has_template_image)
             {
                 break;
@@ -351,12 +358,18 @@ struct PageAnalysis {
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
+    /// Number of Do (XObject invocation) operators in content streams
+    image_count: u32,
+    /// Number of unique non-whitespace text characters found in string operands
+    unique_text_chars: u32,
 }
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut text_ops = 0u32;
     let mut has_images = false;
+    let mut image_count = 0u32;
+    let mut all_unique_chars: HashSet<u8> = HashSet::new();
 
     // Get content streams for this page
     let content_streams = doc.get_page_contents(page_id);
@@ -369,10 +382,15 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 Err(_) => stream.content.clone(),
             };
 
-            // Scan for text operators (Tj, TJ)
-            let (ops, imgs) = scan_content_for_text_operators(&content);
+            // Scan for text operators (Tj, TJ) and image operators (Do)
+            let (ops, imgs, _) = scan_content_for_text_operators(&content);
             text_ops += ops;
-            has_images = has_images || imgs;
+            image_count += imgs;
+            has_images = has_images || imgs > 0;
+
+            // Re-collect unique chars into our accumulator set
+            // (we need the actual set, not just the count, to merge across streams)
+            collect_unique_chars_from_content(&content, &mut all_unique_chars);
         }
     }
 
@@ -380,15 +398,17 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
-            let (ops, imgs) = scan_xobjects_in_resources(doc, resources, &mut visited);
+            let (ops, imgs, _uchars) = scan_xobjects_in_resources(doc, resources, &mut visited);
             text_ops += ops;
-            has_images = has_images || imgs;
+            image_count += imgs;
+            has_images = has_images || imgs > 0;
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                let (ops, imgs) = scan_xobjects_in_resources(doc, resources, &mut visited);
+                let (ops, imgs, _uchars) = scan_xobjects_in_resources(doc, resources, &mut visited);
                 text_ops += ops;
-                has_images = has_images || imgs;
+                image_count += imgs;
+                has_images = has_images || imgs > 0;
             }
         }
     }
@@ -405,6 +425,29 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_images,
         has_template_image,
         total_image_area,
+        image_count,
+        unique_text_chars: all_unique_chars.len() as u32,
+    }
+}
+
+/// Collect unique non-whitespace chars from all text string operands in a content stream.
+/// This mirrors the logic in `scan_content_for_text_operators` but populates a shared set.
+fn collect_unique_chars_from_content(content: &[u8], unique_chars: &mut HashSet<u8>) {
+    let mut i = 0;
+    while i < content.len() {
+        let b = content[i];
+        if b == b'T' && i + 1 < content.len() {
+            let next = content[i + 1];
+            if (next == b'j' || next == b'J')
+                && (i + 2 >= content.len()
+                    || content[i + 2].is_ascii_whitespace()
+                    || content[i + 2] == b'\n'
+                    || content[i + 2] == b'\r')
+            {
+                collect_text_chars_before(content, i, unique_chars);
+            }
+        }
+        i += 1;
     }
 }
 
@@ -412,9 +455,10 @@ fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
-) -> (u32, bool) {
+) -> (u32, u32, u32) {
     let mut text_ops = 0u32;
-    let mut has_images = false;
+    let mut image_count = 0u32;
+    let mut unique_chars = 0u32;
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -443,29 +487,31 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    let (ops, imgs) = scan_content_for_text_operators(&content);
+                    let (ops, imgs, uchars) = scan_content_for_text_operators(&content);
                     text_ops += ops;
-                    has_images = has_images || imgs;
+                    image_count += imgs;
+                    unique_chars = unique_chars.max(uchars);
                     if let Some(res) = stream
                         .dict
                         .get(b"Resources")
                         .ok()
                         .and_then(|o| o.as_dict().ok())
                     {
-                        let (ops2, imgs2) = scan_xobjects_in_resources(doc, res, visited);
+                        let (ops2, imgs2, uchars2) = scan_xobjects_in_resources(doc, res, visited);
                         text_ops += ops2;
-                        has_images = has_images || imgs2;
+                        image_count += imgs2;
+                        unique_chars = unique_chars.max(uchars2);
                     }
                 }
                 Some(b"Image") => {
-                    has_images = true;
+                    image_count += 1;
                 }
                 _ => {}
             }
         }
     }
 
-    (text_ops, has_images)
+    (text_ops, image_count, unique_chars)
 }
 
 /// Fast scan of content stream bytes for text operators
@@ -475,9 +521,12 @@ fn scan_xobjects_in_resources(
 /// - "TJ" - show text with individual glyph positioning
 /// - "'" - move to next line and show text
 /// - "\"" - set word/char spacing, move to next line, show text
-fn scan_content_for_text_operators(content: &[u8]) -> (u32, bool) {
+///
+/// Returns (text_op_count, image_count, unique_text_chars)
+fn scan_content_for_text_operators(content: &[u8]) -> (u32, u32, u32) {
     let mut text_ops = 0u32;
-    let mut has_images = false;
+    let mut image_count = 0u32;
+    let mut unique_chars: HashSet<u8> = HashSet::new();
 
     // Simple state machine to find operators
     let mut i = 0;
@@ -495,6 +544,8 @@ fn scan_content_for_text_operators(content: &[u8]) -> (u32, bool) {
                     || content[i + 2] == b'\r'
                 {
                     text_ops += 1;
+                    // Scan backward for text string operand to collect unique chars
+                    collect_text_chars_before(content, i, &mut unique_chars);
                 }
             }
         }
@@ -505,13 +556,156 @@ fn scan_content_for_text_operators(content: &[u8]) -> (u32, bool) {
             && content[i + 1] == b'o'
             && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace())
         {
-            has_images = true;
+            image_count += 1;
         }
 
         i += 1;
     }
 
-    (text_ops, has_images)
+    (text_ops, image_count, unique_chars.len() as u32)
+}
+
+/// Scan backward from a Tj/TJ operator to find the preceding string operand
+/// and collect unique non-whitespace bytes from it.
+///
+/// Handles both literal strings `(...)` and hex strings `<...>`.
+fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut HashSet<u8>) {
+    // Walk backward past whitespace to find the closing delimiter
+    let mut j = op_pos;
+    while j > 0 {
+        j -= 1;
+        if !content[j].is_ascii_whitespace() {
+            break;
+        }
+    }
+    if j == 0 {
+        return;
+    }
+
+    let closing = content[j];
+
+    if closing == b')' {
+        // Literal string: scan backward for matching '('
+        let mut depth = 1i32;
+        let mut k = j;
+        while k > 0 && depth > 0 {
+            k -= 1;
+            match content[k] {
+                b')' if k == 0 || content[k - 1] != b'\\' => depth += 1,
+                b'(' if k == 0 || content[k - 1] != b'\\' => depth -= 1,
+                _ => {}
+            }
+        }
+        // k now points at '('; collect bytes between (k+1..j)
+        if depth == 0 && k + 1 < j {
+            for &ch in &content[k + 1..j] {
+                if !ch.is_ascii_whitespace() {
+                    unique_chars.insert(ch);
+                }
+            }
+        }
+    } else if closing == b'>' {
+        // Hex string: scan backward for '<'
+        let mut k = j;
+        while k > 0 {
+            k -= 1;
+            if content[k] == b'<' {
+                break;
+            }
+        }
+        if content[k] == b'<' && k + 1 < j {
+            // Decode hex pairs and collect unique non-whitespace bytes
+            let hex_slice = &content[k + 1..j];
+            let hex_clean: Vec<u8> = hex_slice
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            for pair in hex_clean.chunks(2) {
+                if pair.len() == 2 {
+                    let high = hex_val(pair[0]);
+                    let low = hex_val(pair[1]);
+                    if let (Some(h), Some(l)) = (high, low) {
+                        let byte = (h << 4) | l;
+                        if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
+                            unique_chars.insert(byte);
+                        }
+                    }
+                }
+            }
+        }
+    } else if closing == b']' {
+        // TJ array: scan backward for '[' and collect from all strings inside
+        let mut k = j;
+        while k > 0 {
+            k -= 1;
+            if content[k] == b'[' {
+                break;
+            }
+        }
+        if content[k] == b'[' {
+            // Scan forward through the array collecting string contents
+            let mut m = k + 1;
+            while m < j {
+                if content[m] == b'(' {
+                    let start = m + 1;
+                    let mut depth = 1i32;
+                    m += 1;
+                    while m < j && depth > 0 {
+                        match content[m] {
+                            b')' if content[m - 1] != b'\\' => depth -= 1,
+                            b'(' if content[m - 1] != b'\\' => depth += 1,
+                            _ => {}
+                        }
+                        if depth > 0 {
+                            m += 1;
+                        }
+                    }
+                    // collect bytes from start..m
+                    for &ch in &content[start..m] {
+                        if !ch.is_ascii_whitespace() {
+                            unique_chars.insert(ch);
+                        }
+                    }
+                } else if content[m] == b'<' {
+                    let hex_start = m + 1;
+                    m += 1;
+                    while m < j && content[m] != b'>' {
+                        m += 1;
+                    }
+                    let hex_slice = &content[hex_start..m];
+                    let hex_clean: Vec<u8> = hex_slice
+                        .iter()
+                        .copied()
+                        .filter(|b| !b.is_ascii_whitespace())
+                        .collect();
+                    for pair in hex_clean.chunks(2) {
+                        if pair.len() == 2 {
+                            let high = hex_val(pair[0]);
+                            let low = hex_val(pair[1]);
+                            if let (Some(h), Some(l)) = (high, low) {
+                                let byte = (h << 4) | l;
+                                if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
+                                    unique_chars.insert(byte);
+                                }
+                            }
+                        }
+                    }
+                }
+                m += 1;
+            }
+        }
+    }
+}
+
+/// Convert a hex ASCII character to its numeric value (0-15)
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Analyze page images: returns (has_images, total_area, has_template_image)
@@ -624,19 +818,63 @@ mod tests {
     fn test_scan_content_operators() {
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
-        let (ops, imgs) = scan_content_for_text_operators(content);
+        let (ops, imgs, uchars) = scan_content_for_text_operators(content);
         assert_eq!(ops, 1);
-        assert!(!imgs);
+        assert_eq!(imgs, 0);
+        // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
+        assert!(uchars >= 7);
 
         // Content with TJ array
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
-        let (ops2, _) = scan_content_for_text_operators(content2);
+        let (ops2, _, uchars2) = scan_content_for_text_operators(content2);
         assert_eq!(ops2, 1);
+        // H, e, l, o = 4 unique
+        assert!(uchars2 >= 4);
 
         // Content with Do (image)
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
-        let (ops3, imgs3) = scan_content_for_text_operators(content3);
+        let (ops3, imgs3, _) = scan_content_for_text_operators(content3);
         assert_eq!(ops3, 0);
-        assert!(imgs3);
+        assert_eq!(imgs3, 1);
+    }
+
+    #[test]
+    fn test_image_dominated_detection() {
+        // Simulate a page with many Do operators and minimal text
+        let mut content = Vec::new();
+        // Add 50 Do operators (image-heavy)
+        for i in 0..50 {
+            content.extend_from_slice(format!("/Im{i} Do\n").as_bytes());
+        }
+        // Add a few text operators with only a bullet char
+        content.extend_from_slice(b"BT (x) Tj ET\n");
+        content.extend_from_slice(b"BT (x) Tj ET\n");
+        content.extend_from_slice(b"BT (x) Tj ET\n");
+
+        let (ops, imgs, uchars) = scan_content_for_text_operators(&content);
+        assert_eq!(ops, 3);
+        assert_eq!(imgs, 50);
+        // Only 'x' unique char
+        assert_eq!(uchars, 1);
+
+        // This should be image-dominated: 50 > 10 && 50 > 3*3=9
+        let is_image_dominated = imgs > 10 && imgs > ops * 3;
+        assert!(is_image_dominated);
+        // And fails unique char threshold
+        assert!(uchars < 5);
+    }
+
+    #[test]
+    fn test_normal_text_not_image_dominated() {
+        let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
+                         /Img1 Do\n/Img2 Do\n";
+        let (ops, imgs, uchars) = scan_content_for_text_operators(content);
+        assert_eq!(ops, 1);
+        assert_eq!(imgs, 2);
+        // Many unique chars from the sentence
+        assert!(uchars >= 5);
+        // Not image-dominated: 2 > 10 fails
+        let is_image_dominated = imgs > 10 && imgs > ops * 3;
+        assert!(!is_image_dominated);
     }
 }
