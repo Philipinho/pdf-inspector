@@ -200,6 +200,7 @@ pub(crate) fn detect_from_document(
             if analysis.text_operator_count >= config.min_text_ops_per_page
                 && !is_image_dominated
                 && analysis.unique_text_chars >= 5
+                && !analysis.has_vector_text
             {
                 pages_with_text += 1;
             }
@@ -288,12 +289,15 @@ pub(crate) fn detect_from_document(
                     continue;
                 };
                 if analysis.has_template_image
+                    || analysis.has_vector_text
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
                 {
                     ocr_pages.push(page_num);
                 }
             }
+            ocr_pages.sort();
+            ocr_pages.dedup();
             ocr_pages
         }
     };
@@ -362,6 +366,11 @@ struct PageAnalysis {
     image_count: u32,
     /// Number of unique non-whitespace text characters found in string operands
     unique_text_chars: u32,
+    /// Number of path construction/painting ops (m, l, c, h, f, re, etc.)
+    #[allow(dead_code)]
+    path_op_count: u32,
+    /// Whether the page has vector-outlined text (massive path ops, minimal text ops)
+    has_vector_text: bool,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -369,6 +378,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut text_ops = 0u32;
     let mut has_images = false;
     let mut image_count = 0u32;
+    let mut path_ops = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
 
     // Get content streams for this page
@@ -382,10 +392,12 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 Err(_) => stream.content.clone(),
             };
 
-            // Scan for text operators (Tj, TJ) and image operators (Do)
-            let (ops, imgs) = scan_content_for_text_operators(&content, &mut all_unique_chars);
+            // Scan for text operators (Tj, TJ), image operators (Do), and path ops
+            let (ops, imgs, paths) =
+                scan_content_for_text_operators(&content, &mut all_unique_chars);
             text_ops += ops;
             image_count += imgs;
+            path_ops += paths;
             has_images = has_images || imgs > 0;
         }
     }
@@ -394,18 +406,20 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
-            let (ops, imgs) =
+            let (ops, imgs, paths) =
                 scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
             text_ops += ops;
             image_count += imgs;
+            path_ops += paths;
             has_images = has_images || imgs > 0;
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                let (ops, imgs) =
+                let (ops, imgs, paths) =
                     scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
                 text_ops += ops;
                 image_count += imgs;
+                path_ops += paths;
                 has_images = has_images || imgs > 0;
             }
         }
@@ -418,6 +432,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_images = true;
     }
 
+    // Vector-outlined text: massive path ops with minimal text ops.
+    // Each outlined glyph needs ~10-30 path commands, so a page of
+    // outlined text produces thousands of path ops.
+    let has_vector_text = path_ops >= 1000 && path_ops > text_ops.saturating_mul(200);
+
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
@@ -425,6 +444,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
+        path_op_count: path_ops,
+        has_vector_text,
     }
 }
 
@@ -433,9 +454,10 @@ fn scan_xobjects_in_resources(
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
-) -> (u32, u32) {
+) -> (u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
+    let mut path_ops = 0u32;
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -464,19 +486,22 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    let (ops, imgs) = scan_content_for_text_operators(&content, unique_chars);
+                    let (ops, imgs, paths) =
+                        scan_content_for_text_operators(&content, unique_chars);
                     text_ops += ops;
                     image_count += imgs;
+                    path_ops += paths;
                     if let Some(res) = stream
                         .dict
                         .get(b"Resources")
                         .ok()
                         .and_then(|o| o.as_dict().ok())
                     {
-                        let (ops2, imgs2) =
+                        let (ops2, imgs2, paths2) =
                             scan_xobjects_in_resources(doc, res, visited, unique_chars);
                         text_ops += ops2;
                         image_count += imgs2;
+                        path_ops += paths2;
                     }
                 }
                 Some(b"Image") => {
@@ -487,7 +512,7 @@ fn scan_xobjects_in_resources(
         }
     }
 
-    (text_ops, image_count)
+    (text_ops, image_count, path_ops)
 }
 
 /// Fast scan of content stream bytes for text operators
@@ -498,11 +523,21 @@ fn scan_xobjects_in_resources(
 /// - "'" - move to next line and show text
 /// - "\"" - set word/char spacing, move to next line, show text
 ///
-/// Returns (text_op_count, image_count).
+/// Returns (text_op_count, image_count, path_op_count).
 /// Unique non-whitespace text characters are collected into `unique_chars`.
-fn scan_content_for_text_operators(content: &[u8], unique_chars: &mut HashSet<u8>) -> (u32, u32) {
+fn scan_content_for_text_operators(
+    content: &[u8],
+    unique_chars: &mut HashSet<u8>,
+) -> (u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
+    let mut path_ops = 0u32;
+
+    // Helper: check if position is a word boundary (start of content or preceded by whitespace)
+    let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
+    // Helper: check if position is at end or followed by whitespace
+    let is_word_end =
+        |pos: usize| -> bool { pos + 1 >= content.len() || content[pos + 1].is_ascii_whitespace() };
 
     // Simple state machine to find operators
     let mut i = 0;
@@ -535,10 +570,39 @@ fn scan_content_for_text_operators(content: &[u8], unique_chars: &mut HashSet<u8
             image_count += 1;
         }
 
+        // Count path construction/painting operators.
+        // Single-byte: m (moveto), l (lineto), c (curveto), h (closepath),
+        //              f (fill), S (stroke), s (close+stroke), B (fill+stroke),
+        //              F (fill, variant)
+        // These are the high-volume operators in vector-outlined text.
+        match b {
+            b'm' | b'l' | b'c' | b'h' | b'f' | b'S' | b's' | b'B' | b'F'
+                if is_word_start(i) && is_word_end(i) =>
+            {
+                path_ops += 1;
+            }
+            // Two-byte: re (rect), f* (fill even-odd)
+            b'r' if i + 1 < content.len()
+                && content[i + 1] == b'e'
+                && is_word_start(i)
+                && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
+            {
+                path_ops += 1;
+            }
+            b'f' if i + 1 < content.len()
+                && content[i + 1] == b'*'
+                && is_word_start(i)
+                && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
+            {
+                path_ops += 1;
+            }
+            _ => {}
+        }
+
         i += 1;
     }
 
-    (text_ops, image_count)
+    (text_ops, image_count, path_ops)
 }
 
 /// Scan backward from a Tj/TJ operator to find the preceding string operand
@@ -796,7 +860,7 @@ mod tests {
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
-        let (ops, imgs) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
@@ -805,7 +869,7 @@ mod tests {
         // Content with TJ array
         uchars.clear();
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
-        let (ops2, _) = scan_content_for_text_operators(content2, &mut uchars);
+        let (ops2, _, _) = scan_content_for_text_operators(content2, &mut uchars);
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
         assert!(uchars.len() >= 4);
@@ -813,7 +877,7 @@ mod tests {
         // Content with Do (image)
         uchars.clear();
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
-        let (ops3, imgs3) = scan_content_for_text_operators(content3, &mut uchars);
+        let (ops3, imgs3, _) = scan_content_for_text_operators(content3, &mut uchars);
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 1);
     }
@@ -832,7 +896,7 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
         let mut uchars = HashSet::new();
-        let (ops, imgs) = scan_content_for_text_operators(&content, &mut uchars);
+        let (ops, imgs, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(ops, 3);
         assert_eq!(imgs, 50);
         // Only 'x' unique char
@@ -850,7 +914,7 @@ mod tests {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
         let mut uchars = HashSet::new();
-        let (ops, imgs) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
         assert_eq!(imgs, 2);
         // Many unique chars from the sentence
@@ -858,5 +922,87 @@ mod tests {
         // Not image-dominated: 2 > 10 fails
         let is_image_dominated = imgs > 10 && imgs > ops * 3;
         assert!(!is_image_dominated);
+    }
+
+    #[test]
+    fn test_path_heavy_detection() {
+        // Simulate vector-outlined text: many path ops, few text ops
+        let mut content = Vec::new();
+        // Add a couple text ops
+        content.extend_from_slice(b"BT (Header) Tj ET\n");
+        // Add 2000 path ops (simulating outlined glyphs)
+        for _ in 0..500 {
+            content.extend_from_slice(b"100 200 m 150 250 l 200 200 c h\n");
+        }
+        content.extend_from_slice(b"f\n");
+
+        let mut uchars = HashSet::new();
+        let (text, imgs, paths) = scan_content_for_text_operators(&content, &mut uchars);
+        assert_eq!(text, 1);
+        assert_eq!(imgs, 0);
+        // 500 * (m + l + c + h) + 1 f = 2001
+        assert!(paths >= 2000, "expected >= 2000 path ops, got {paths}");
+
+        // Should trigger vector text detection: paths >= 1000 && paths > text * 200
+        let has_vector_text = paths >= 1000 && paths > text.saturating_mul(200);
+        assert!(has_vector_text);
+    }
+
+    #[test]
+    fn test_normal_paths_not_vector_text() {
+        // Normal page: text with some decorative paths (charts, borders)
+        let mut content = Vec::new();
+        // 20 text ops
+        for _ in 0..20 {
+            content.extend_from_slice(b"BT (Some text content here) Tj ET\n");
+        }
+        // 50 path ops (a chart or border)
+        for _ in 0..10 {
+            content.extend_from_slice(b"100 200 m 150 250 l 200 200 c h f\n");
+        }
+
+        let mut uchars = HashSet::new();
+        let (text, _, paths) = scan_content_for_text_operators(&content, &mut uchars);
+        assert_eq!(text, 20);
+        assert!(paths >= 40, "expected >= 40 path ops, got {paths}");
+
+        // Should NOT trigger: paths < 1000
+        let has_vector_text = paths >= 1000 && paths > text.saturating_mul(200);
+        assert!(!has_vector_text);
+    }
+
+    #[test]
+    fn test_epever_vector_text_detection() {
+        // Integration test: EPEVER PDF should be Mixed with page 2 needing OCR
+        let path = std::path::Path::new("./tests/fixtures/EPEVER-DataSheet-XTRA-N-G3-Series-3.pdf");
+        let path = if path.exists() {
+            path.to_path_buf()
+        } else {
+            let alt = std::path::PathBuf::from(
+                "../pdf-evals/pdfs/EPEVER-DataSheet-XTRA-N-G3-Series-3.pdf",
+            );
+            if !alt.exists() {
+                // PDF not available, skip test
+                return;
+            }
+            alt
+        };
+
+        let config = DetectionConfig {
+            strategy: ScanStrategy::Full,
+            ..DetectionConfig::default()
+        };
+        let result = detect_pdf_type_with_config(&path, config).unwrap();
+        assert_eq!(
+            result.pdf_type,
+            PdfType::Mixed,
+            "EPEVER should be Mixed (page 2 has vector-outlined text)"
+        );
+        assert!(
+            result.pages_needing_ocr.contains(&2),
+            "Page 2 should need OCR, got: {:?}",
+            result.pages_needing_ocr
+        );
+        assert!(result.ocr_recommended);
     }
 }
