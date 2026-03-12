@@ -15,8 +15,11 @@ pub(crate) fn find_column_boundaries(
         return vec![];
     }
 
-    // Calculate adaptive threshold based on X-position density
-    // For dense tables (like grade tables), use smaller threshold
+    // For dense, narrow-column tables (e.g. train schedules with 24 cols at
+    // 26pt spacing), the old avg_gap approach over-clusters because avg_gap is
+    // dominated by the many items *within* each column.  Use a gap-histogram
+    // on consecutive position gaps to detect when columns are densely packed,
+    // and only then lower the threshold below 25pt.
     let x_range = x_positions.last().unwrap() - x_positions.first().unwrap();
     let avg_gap = if x_positions.len() > 1 {
         x_range / (x_positions.len() - 1) as f32
@@ -24,17 +27,70 @@ pub(crate) fn find_column_boundaries(
         60.0
     };
 
-    // Use smaller threshold for dense data, larger for sparse
-    let cluster_threshold = avg_gap.clamp(25.0, 50.0);
+    // Default: original avg_gap approach, center-based clustering
+    let mut cluster_threshold = avg_gap.clamp(25.0, 50.0);
+    let mut use_edge_clustering = false;
+
+    // Analyze the distribution of non-trivial consecutive gaps to detect
+    // a bimodal pattern (small within-column gaps vs large between-column gaps).
+    // When detected, switch to edge-based clustering with the lower threshold
+    // to correctly separate densely-packed columns without over-splitting
+    // wide columns (edge-based avoids the center-drift problem).
+    let mut consec_gaps: Vec<f32> = x_positions
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&g| g > 0.1) // skip near-duplicate positions
+        .collect();
+
+    if consec_gaps.len() > 2 {
+        consec_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Find the biggest jump in the sorted gap sequence — natural break
+        // between within-column jitter and between-column spacing.
+        // Require at least 3 values on each side to avoid outlier-dominated
+        // splits (e.g. a single large page-margin gap).
+        let mut best_split = consec_gaps.len() / 2;
+        let mut best_jump = 0.0f32;
+        let min_side = 3.min(consec_gaps.len() / 2);
+        for i in 0..consec_gaps.len().saturating_sub(1) {
+            let left_count = i + 1;
+            let right_count = consec_gaps.len() - i - 1;
+            if left_count < min_side || right_count < min_side {
+                continue;
+            }
+            let jump = consec_gaps[i + 1] - consec_gaps[i];
+            if jump > best_jump {
+                best_jump = jump;
+                best_split = i;
+            }
+        }
+        let threshold = (consec_gaps[best_split]
+            + consec_gaps[(best_split + 1).min(consec_gaps.len() - 1)])
+            / 2.0;
+        // Only override for genuinely dense tables: many items packed into
+        // a wide range (e.g. 1200+ items for a 24-column train schedule).
+        // Smaller item counts (< 500) with a bimodal gap pattern are usually
+        // normal tables where center-based clustering works correctly.
+        if threshold < 15.0 && best_jump > 2.0 && x_positions.len() > 500 {
+            cluster_threshold = threshold.clamp(8.0, 25.0);
+            use_edge_clustering = true;
+        }
+    }
 
     let mut columns = Vec::new();
     let mut cluster_items: Vec<f32> = vec![x_positions[0]];
 
     for &x in &x_positions[1..] {
-        let cluster_center = cluster_items.iter().sum::<f32>() / cluster_items.len() as f32;
+        // For dense columns (gap-histogram triggered), use edge-based clustering:
+        // compare with the last item to avoid center-drift that merges adjacent
+        // narrow columns.  For normal tables, use center-based (original behavior).
+        let reference = if use_edge_clustering {
+            *cluster_items.last().unwrap()
+        } else {
+            cluster_items.iter().sum::<f32>() / cluster_items.len() as f32
+        };
 
-        if x - cluster_center > cluster_threshold {
-            // End current cluster
+        if x - reference > cluster_threshold {
+            let cluster_center = cluster_items.iter().sum::<f32>() / cluster_items.len() as f32;
             columns.push(cluster_center);
             cluster_items = vec![x];
         } else {
@@ -643,5 +699,76 @@ mod tests {
 
         recover_header_row(&mut table, &all_items, 9.0);
         assert!(table.cells.is_empty());
+    }
+
+    #[test]
+    fn test_find_column_boundaries_dense_schedule() {
+        // Simulate a 24-column train schedule with ~26pt column spacing and
+        // per-glyph items that create many X-positions within each column.
+        let mut items: Vec<(usize, TextItem)> = Vec::new();
+        let mut rng_offset = 0.0f32;
+        for col in 0..24 {
+            let base_x = 50.0 + col as f32 * 26.0;
+            // ~50 items per column with ±2pt jitter to simulate per-glyph text
+            for row in 0..50 {
+                rng_offset = (rng_offset + 0.7) % 4.0; // deterministic pseudo-jitter
+                let x = base_x + rng_offset - 2.0;
+                let y = 700.0 - row as f32 * 12.0;
+                items.push((
+                    0,
+                    TextItem {
+                        text: format!("{}", row),
+                        x,
+                        y,
+                        width: 8.0,
+                        font_size: 7.0,
+                        height: 7.0,
+                        font: String::new(),
+                        is_bold: false,
+                        is_italic: false,
+                        item_type: ItemType::Text,
+                        page: 1,
+                    },
+                ));
+            }
+        }
+        let refs: Vec<(usize, &TextItem)> = items.iter().map(|(i, t)| (*i, t)).collect();
+        let cols = find_column_boundaries(&refs, TableDetectionMode::SmallFont);
+        // Should find close to 24 columns (within ±2)
+        assert!(
+            cols.len() >= 22 && cols.len() <= 26,
+            "Expected ~24 columns, got {}",
+            cols.len()
+        );
+    }
+
+    #[test]
+    fn test_find_column_boundaries_wide_spacing_still_works() {
+        // Normal table with 4 widely-spaced columns — should still work
+        let mut items = Vec::new();
+        for col in 0..4 {
+            let base_x = 50.0 + col as f32 * 120.0;
+            for row in 0..10 {
+                items.push((
+                    0,
+                    TextItem {
+                        text: format!("cell_{}_{}", col, row),
+                        x: base_x + (row as f32 * 0.3),
+                        y: 700.0 - row as f32 * 15.0,
+                        width: 40.0,
+                        font_size: 10.0,
+                        height: 7.0,
+                        font: String::new(),
+                        is_bold: false,
+                        is_italic: false,
+                        item_type: ItemType::Text,
+                        page: 1,
+                    },
+                ));
+            }
+        }
+        let refs: Vec<(usize, &TextItem)> = items.iter().map(|(i, t)| (*i, t)).collect();
+        let cols = find_column_boundaries(&refs, TableDetectionMode::BodyFont);
+        assert_eq!(cols.len(), 4, "Expected 4 columns, got {}", cols.len());
     }
 }

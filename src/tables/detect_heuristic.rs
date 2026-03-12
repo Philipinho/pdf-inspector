@@ -426,7 +426,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::SmallFont => 2,
         TableDetectionMode::BodyFont => 3,
     };
-    if columns.len() < min_cols || columns.len() > 15 {
+    if columns.len() < min_cols || columns.len() > 25 {
         return None;
     }
 
@@ -549,32 +549,26 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     }
 
     // Validation 5: Check for key-value pair layout (NOT a table)
-    // Key-value layouts have: mostly 2 filled columns, first column is labels
     if is_key_value_layout(&cells) {
         return None;
     }
 
     // Validation 6: Check column count consistency
-    // Real tables have similar column counts across rows
     if !has_consistent_columns(&cells) {
         return None;
     }
 
     // Validation 7: Tables should have some numeric/data content
-    // (not just text labels)
     if !has_table_like_content(&cells, mode) {
         return None;
     }
 
     // Validation 8: Check for Table of Contents pattern
-    // TOCs have dots (leader lines) and page numbers, not real table data
     if is_table_of_contents(&cells) {
         return None;
     }
 
-    // Validation 9: Reject paragraph-like content falsely detected as tables.
-    // Real table cells are short and self-contained. Paragraph text split into
-    // "cells" produces long sentence fragments.
+    // Validation 9: Reject paragraph-like content falsely detected as tables
     if is_paragraph_content(&cells) {
         return None;
     }
@@ -663,13 +657,21 @@ fn has_consistent_columns(cells: &[Vec<String>]) -> bool {
         .map(|(count, _)| *count)
         .unwrap_or(0);
 
-    // At least 40% of rows should have the most common column count (or close to it)
+    // At least 40% of rows should have the most common column count (or close to it).
+    // Very wide tables (e.g. 24-column train schedules) have inherently variable fill,
+    // so use wider tolerance and lower ratio.  Threshold at 15 to avoid false-positives
+    // on moderately-wide tables where the strict check works well.
+    let num_cols = cells[0].len();
+    let tolerance = if num_cols > 15 { num_cols / 4 } else { 2 };
     let consistent_rows = filled_counts
         .iter()
-        .filter(|&&c| c >= most_common_count.saturating_sub(2) && c <= most_common_count + 2)
+        .filter(|&&c| {
+            c >= most_common_count.saturating_sub(tolerance) && c <= most_common_count + tolerance
+        })
         .count();
 
-    consistent_rows as f32 / cells.len() as f32 > 0.4
+    let min_ratio = if num_cols > 15 { 0.25 } else { 0.40 };
+    consistent_rows as f32 / cells.len() as f32 > min_ratio
 }
 
 /// Check if the content looks like table data (numbers, short values, specs)
