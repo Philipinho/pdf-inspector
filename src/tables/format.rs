@@ -17,7 +17,8 @@ pub fn table_to_markdown(table: &Table) -> String {
     let num_cols = cleaned_cells[0].len();
     let mut output = String::new();
 
-    // Calculate column widths for alignment
+    // Calculate column widths for alignment (capped to avoid massive whitespace padding)
+    const MAX_COL_WIDTH: usize = 40;
     let col_widths: Vec<usize> = (0..num_cols)
         .map(|col| {
             cleaned_cells
@@ -25,7 +26,7 @@ pub fn table_to_markdown(table: &Table) -> String {
                 .map(|row| row.get(col).map(|c| c.len()).unwrap_or(0))
                 .max()
                 .unwrap_or(3)
-                .max(3)
+                .clamp(3, MAX_COL_WIDTH)
         })
         .collect();
 
