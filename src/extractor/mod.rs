@@ -342,7 +342,7 @@ mod tests {
     use super::*;
     use crate::text_utils::{is_cjk_char, is_rtl_char, is_rtl_text, sort_line_items};
     use crate::types::{ItemType, TextLine};
-    use layout::{detect_columns, is_newspaper_layout};
+    use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
 
     #[test]
     fn test_group_into_lines() {
@@ -863,7 +863,17 @@ mod tests {
             .map(|i| make_line(700.0 - i as f32 * 14.0, 350.0, 1))
             .collect();
 
-        assert!(is_newspaper_layout(&[col1, col2]));
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 600.0,
+            },
+        ];
+        assert!(is_newspaper_layout(&[col1, col2], &cols));
     }
 
     #[test]
@@ -897,7 +907,17 @@ mod tests {
             .map(|i| make_line(685.0 - i as f32 * 14.0, 350.0, 1))
             .collect();
 
-        assert!(is_newspaper_layout(&[col1, col2]));
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 600.0,
+            },
+        ];
+        assert!(is_newspaper_layout(&[col1, col2], &cols));
     }
 
     #[test]
@@ -929,6 +949,16 @@ mod tests {
             .map(|i| make_line(700.0 - i as f32 * 14.0, 350.0, 1))
             .collect();
 
-        assert!(!is_newspaper_layout(&[col1, col2]));
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 600.0,
+            },
+        ];
+        assert!(!is_newspaper_layout(&[col1, col2], &cols));
     }
 }

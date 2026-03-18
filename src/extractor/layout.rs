@@ -257,21 +257,78 @@ fn is_page_number(item: &TextItem) -> bool {
 /// Group text items into lines, with multi-column support
 /// Detect newspaper-style columns: independent text flows that should be read
 /// sequentially (all of col1, then col2) rather than Y-interleaved.
-pub(crate) fn is_newspaper_layout(per_column_lines: &[Vec<TextLine>]) -> bool {
+pub(crate) fn is_newspaper_layout(
+    per_column_lines: &[Vec<TextLine>],
+    columns: &[ColumnRegion],
+) -> bool {
     if per_column_lines.len() < 2 {
         return false;
     }
 
     // Each column must independently have substantial content
     let min_lines = per_column_lines.iter().map(|c| c.len()).min().unwrap_or(0);
+    let max_lines = per_column_lines.iter().map(|c| c.len()).max().unwrap_or(0);
+
+    if min_lines < 5 {
+        return false;
+    }
+
     if min_lines < 15 {
+        // Sidebar detection: a narrow annotation column beside a wide body column.
+        // Guards:
+        //   - Only 2 columns (sidebars are body+sidebar, not 3+ columns)
+        //   - width_ratio < 0.50: sidebar is much narrower than body
+        //   - line_balance < 0.35: sidebar has significantly fewer lines
+        //   - max_lines >= 20: body column has substantial prose content
+        //   - narrower column has fewer lines (not a dense reference column)
+        if columns.len() == 2 && per_column_lines.len() == 2 {
+            let w0 = columns[0].x_max - columns[0].x_min;
+            let w1 = columns[1].x_max - columns[1].x_min;
+            let width_ratio = w0.min(w1) / w0.max(w1);
+            let line_balance = if max_lines > 0 {
+                min_lines as f32 / max_lines as f32
+            } else {
+                1.0
+            };
+            let narrow_width = w0.min(w1);
+            if width_ratio < 0.50 && line_balance < 0.35 && max_lines >= 20 && narrow_width >= 160.0
+            {
+                let narrower_idx = if w0 < w1 { 0 } else { 1 };
+                let fewest_idx = if per_column_lines[0].len() <= per_column_lines[1].len() {
+                    0
+                } else {
+                    1
+                };
+                if narrower_idx == fewest_idx {
+                    // Sparse density check: sidebar annotations are spread thinly
+                    // across the page height while regular two-column text is dense.
+                    // Compare average Y-gap between successive lines in each column.
+                    let narrow = &per_column_lines[narrower_idx];
+                    let wide = &per_column_lines[1 - narrower_idx];
+                    let avg_gap = |lines: &[TextLine]| -> f32 {
+                        if lines.len() < 2 {
+                            return 0.0;
+                        }
+                        let mut ys: Vec<f32> = lines.iter().map(|l| l.y).collect();
+                        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let span = ys.last().unwrap() - ys.first().unwrap();
+                        span / (lines.len() as f32 - 1.0)
+                    };
+                    let narrow_gap = avg_gap(narrow);
+                    let wide_gap = avg_gap(wide);
+                    // Sidebar annotations have >2.5x the average gap of body text
+                    if wide_gap > 0.0 && narrow_gap / wide_gap >= 2.5 {
+                        return true;
+                    }
+                }
+            }
+        }
         return false;
     }
 
     // Dense balanced columns (similar line counts) are newspaper regardless of Y-alignment.
     // By this point table items are already removed, so two dense balanced columns
     // of remaining text are independent prose flows.
-    let max_lines = per_column_lines.iter().map(|c| c.len()).max().unwrap_or(0);
     let balance_ratio = min_lines as f32 / max_lines as f32;
     if balance_ratio > 0.7 {
         return true;
@@ -485,7 +542,7 @@ pub(crate) fn group_into_lines_with_thresholds(
             // Process spanning items as their own group
             let spanning_lines = group_single_column(spanning_items, adaptive_threshold);
 
-            let is_newspaper = is_newspaper_layout(&per_column_lines);
+            let is_newspaper = is_newspaper_layout(&per_column_lines, &columns);
             debug!(
                 "page {}: layout={}",
                 page,
@@ -832,6 +889,79 @@ mod tests {
             cols.len() >= 3,
             "Expected >=3 columns for dense zones, got {}",
             cols.len()
+        );
+    }
+
+    /// Helper: build a Vec<TextLine> with `n` lines at given X, starting at Y=700.
+    fn make_lines(n: usize, x: f32) -> Vec<TextLine> {
+        (0..n)
+            .map(|i| {
+                let y = 700.0 - i as f32 * 14.0;
+                let item = make_item(1, x, y, "SomeText__");
+                TextLine {
+                    y,
+                    page: 1,
+                    adaptive_threshold: 0.10,
+                    items: vec![item],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sidebar_layout_detected_as_newspaper() {
+        // Wide body column (x 0..400) with 40 lines,
+        // narrow sidebar (x 420..590, width 170) with 12 lines.
+        // width_ratio = 170/400 = 0.425, line_balance = 12/40 = 0.30 → sidebar → newspaper
+        // Sidebar lines have ~3x gap of body lines (sparse annotations).
+        let body = make_lines(40, 50.0);
+        let sidebar: Vec<TextLine> = (0..12)
+            .map(|i| {
+                let y = 693.0 - i as f32 * 45.0; // sparse annotations: ~3x body gap
+                let item = make_item(1, 440.0, y, "SomeText__");
+                TextLine {
+                    y,
+                    page: 1,
+                    adaptive_threshold: 0.10,
+                    items: vec![item],
+                }
+            })
+            .collect();
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 400.0,
+            },
+            ColumnRegion {
+                x_min: 420.0,
+                x_max: 590.0,
+            },
+        ];
+        assert!(
+            is_newspaper_layout(&[body, sidebar], &cols),
+            "Wide body + narrow sidebar should be detected as newspaper"
+        );
+    }
+
+    #[test]
+    fn borderless_table_not_misclassified() {
+        // Two columns of similar width and equal line counts → borderless table, not newspaper.
+        // width_ratio = 250/300 = 0.83 (> 0.50), so sidebar guard fails → false.
+        let col1 = make_lines(10, 50.0);
+        let col2 = make_lines(10, 350.0);
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 550.0,
+            },
+        ];
+        assert!(
+            !is_newspaper_layout(&[col1, col2], &cols),
+            "Equal-width equal-row columns should NOT be newspaper (borderless table)"
         );
     }
 }
