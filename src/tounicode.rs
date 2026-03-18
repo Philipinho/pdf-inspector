@@ -1920,6 +1920,13 @@ impl FontCMaps {
             if font_dict.get(b"ToUnicode").is_ok() {
                 continue;
             }
+            // Skip fonts with explicit encoding — they can be decoded by the
+            // standard encoding path (lopdf) and don't need a fallback CMap.
+            if let Ok(enc) = font_dict.get(b"Encoding") {
+                if enc.as_name().is_ok() || enc.as_dict().is_ok() || enc.as_reference().is_ok() {
+                    continue;
+                }
+            }
             let subtype = match font_dict
                 .get(b"Subtype")
                 .ok()
@@ -1930,18 +1937,6 @@ impl FontCMaps {
             };
             if subtype == b"Type0" {
                 continue;
-            }
-            // Skip non-TrueType fonts with explicit encoding — they can be
-            // decoded by the standard encoding path and don't need a fallback.
-            // TrueType fonts are NOT skipped: OCR-generated PDFs often declare
-            // WinAnsiEncoding but the embedded font's cmap has the real mapping.
-            if subtype != b"TrueType" {
-                if let Ok(enc) = font_dict.get(b"Encoding") {
-                    if enc.as_name().is_ok() || enc.as_dict().is_ok() || enc.as_reference().is_ok()
-                    {
-                        continue;
-                    }
-                }
             }
 
             let font_descriptor = font_dict.get(b"FontDescriptor").ok().and_then(|o| match o {
