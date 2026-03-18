@@ -391,6 +391,16 @@ fn process_document(
         None => (None, LayoutComplexity::default(), false),
     };
 
+    // If the extracted text is predominantly garbage (non-alphanumeric) and
+    // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
+    // layer comes from a bad OCR pass, and callers should use proper OCR.
+    let (pdf_type, markdown, confidence) =
+        if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
+            (PdfType::Scanned, None, 0.95)
+        } else {
+            (pdf_type, markdown, confidence)
+        };
+
     Ok(PdfProcessResult {
         pdf_type,
         markdown,
@@ -442,6 +452,32 @@ fn detect_encoding_issues(markdown: &str) -> bool {
     }
 
     false
+}
+
+/// Check if extracted text is predominantly garbage (non-alphanumeric).
+///
+/// Broken font encodings produce text like "----1-.-.-.___  --.-. .._ I_---."
+/// where most characters are punctuation/symbols. Real text in any language
+/// has >50% alphanumeric characters.
+fn is_garbage_text(markdown: &str) -> bool {
+    let mut alphanum = 0usize;
+    let mut non_alphanum = 0usize;
+    for ch in markdown.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        // Skip markdown syntax chars that we add (not from the PDF)
+        if matches!(ch, '#' | '*' | '|' | '-' | '\n') {
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            alphanum += 1;
+        } else {
+            non_alphanum += 1;
+        }
+    }
+    let total = alphanum + non_alphanum;
+    total >= 50 && alphanum * 2 < total
 }
 
 /// Analyse extracted items and rects for layout complexity.

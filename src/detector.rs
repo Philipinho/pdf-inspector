@@ -197,10 +197,11 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} path_ops={} vector_text={} image_area={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
-                analysis.unique_text_chars, analysis.path_op_count, analysis.has_vector_text,
+                analysis.unique_text_chars, analysis.unique_alphanum_chars,
+                analysis.path_op_count, analysis.has_vector_text,
                 analysis.total_image_area
             );
             let is_image_dominated = analysis.image_count > 10
@@ -265,9 +266,8 @@ pub(crate) fn detect_from_document(
 
     // Classification logic
     let (pdf_type, confidence) = if has_template_images && pages_with_text > 0 {
-        // Template-based PDF: has text but images provide essential context
-        // Classify as Mixed with lower confidence
         ocr_recommended = true;
+        // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
     } else if text_ratio >= config.text_page_ratio_threshold {
         ocr_recommended = false;
@@ -383,6 +383,8 @@ struct PageAnalysis {
     image_count: u32,
     /// Number of unique non-whitespace text characters found in string operands
     unique_text_chars: u32,
+    /// Number of unique ASCII alphanumeric bytes (letters + digits) in string operands
+    unique_alphanum_chars: u32,
     /// Number of path construction/painting ops (m, l, c, h, f, re, etc.)
     #[allow(dead_code)]
     path_op_count: u32,
@@ -454,6 +456,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // outlined text produces thousands of path ops.
     let has_vector_text = path_ops >= 1000 && path_ops > text_ops.saturating_mul(200);
 
+    let unique_alphanum_chars = all_unique_chars
+        .iter()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .count() as u32;
+
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
@@ -461,6 +468,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
+        unique_alphanum_chars,
         path_op_count: path_ops,
         has_vector_text,
     }
@@ -799,6 +807,13 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
                 &mut visited,
             );
         }
+    }
+
+    // Tiled scans: many small image tiles (e.g., JBIG2 strips) that together
+    // cover the full page. No individual tile triggers the template threshold,
+    // but the aggregate area clearly indicates a scanned/image-backed page.
+    if !has_template_image && total_area >= TEMPLATE_IMAGE_THRESHOLD * 4 {
+        has_template_image = true;
     }
 
     (has_images, total_area, has_template_image)
