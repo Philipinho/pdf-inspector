@@ -437,8 +437,23 @@ fn process_document(
             (pdf_type, markdown, confidence)
         };
 
+    // If a TextBased PDF produces garbage text, the fonts are undecodable
+    // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
+    // Drop the useless markdown and flag all pages for OCR.
+    let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
+        && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
+    {
+        log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
+        (None, true, true)
+    } else {
+        (markdown, has_encoding_issues, false)
+    };
+
     // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list
     let mut pages_needing_ocr = pages_needing_ocr;
+    if force_ocr_all {
+        pages_needing_ocr = (1..=page_count).collect();
+    }
     if !gid_pages.is_empty() {
         log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
         for page in gid_pages {
@@ -826,5 +841,24 @@ mod tests {
         // Under threshold of 10 total dollars — should not trigger
         let text = "a$b c$d e$f";
         assert!(!detect_encoding_issues(text));
+    }
+
+    #[test]
+    fn test_garbage_text_detection() {
+        // Simulates garbage output from Identity-H fonts without ToUnicode.
+        // Needs >= 50 non-whitespace chars and < 50% alphanumeric.
+        let garbage = ",&<X ~%5&8-!A ~*(!,-!U (/#!U X ~#/=U 9/%*(!U !(  X \
+                       (%U-(-/ V %&((8-#&&< *,(6--< %5&8-!( (,(/! #/<5U X \
+                       º&( >/5 /5&(#(8-!5 *,(6--( *,%@/-A W";
+        assert!(is_garbage_text(garbage));
+
+        // Normal text should not be garbage
+        let normal = "This is a normal paragraph with words and sentences that contains enough characters to pass the threshold.";
+        assert!(!is_garbage_text(normal));
+
+        // Cyrillic text should not be garbage
+        let cyrillic =
+            "Роботизированные технологии комплексы для производства металлургических предприятий";
+        assert!(!is_garbage_text(cyrillic));
     }
 }
