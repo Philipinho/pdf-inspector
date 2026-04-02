@@ -441,7 +441,7 @@ fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
 fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
     match obj {
         lopdf::Object::Integer(i) => Some(*i as f32),
-        lopdf::Object::Real(f) => Some(*f as f32),
+        lopdf::Object::Real(f) => Some(*f),
         _ => None,
     }
 }
