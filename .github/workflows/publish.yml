@@ -76,24 +76,25 @@ jobs:
         with:
           path: napi/artifacts
 
-      - name: Move artifacts
-        working-directory: napi
-        run: bunx napi artifacts --build-output-dir artifacts
-
-      - name: List packages
-        working-directory: napi
-        run: ls -R npm/
-
-      - name: Publish
+      - name: Prepare and publish
         working-directory: napi
         run: |
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
           echo "@firecrawl:registry=https://npm.pkg.github.com" >> .npmrc
+
+          # Create platform package dirs and move binaries
           bunx napi prepublish -t npm
-          npm publish --access public
+          bunx napi artifacts --build-output-dir artifacts
+
+          echo "=== Package contents ==="
+          ls -R npm/
+
+          # Publish platform packages first, then main package
           for dir in npm/*/; do
             if [ -f "$dir/package.json" ]; then
               echo "Publishing $dir"
               (cd "$dir" && npm publish --access public)
             fi
           done
+          echo "Publishing main package"
+          npm publish --access public
