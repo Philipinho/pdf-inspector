@@ -90,8 +90,8 @@ jobs:
         working-directory: napi
         run: |
           cp artifacts/bindings-*/*.node .
-          cp artifacts/js-bindings/napi/index.js .
-          cp artifacts/js-bindings/napi/index.d.ts .
+          cp artifacts/js-bindings/index.js .
+          cp artifacts/js-bindings/index.d.ts .
 
           echo "=== Package contents ==="
           ls -la *.node index.js index.d.ts
