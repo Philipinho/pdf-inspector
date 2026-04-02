@@ -86,7 +86,7 @@ jobs:
 
       - name: Generate JS bindings
         working-directory: napi
-        run: bunx napi prepublish --skip-gh-release
+        run: bunx napi pre-publish
 
       - name: Collect binaries and publish
         working-directory: napi
