@@ -46,7 +46,7 @@ pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tounicode::FontCMaps;
 
@@ -262,6 +262,230 @@ pub fn process_pdf_mem_with_config(
             .detection(config)
             .markdown(markdown_options),
     )
+}
+
+// =========================================================================
+// Region-based text extraction (for hybrid OCR pipelines)
+// =========================================================================
+
+/// Lightweight classification result for routing decisions.
+#[derive(Debug)]
+pub struct PdfClassification {
+    /// The detected PDF type.
+    pub pdf_type: PdfType,
+    /// Total page count.
+    pub page_count: u32,
+    /// 0-indexed page numbers that need OCR (scanned/image pages).
+    pub pages_needing_ocr: Vec<u32>,
+    /// Detection confidence score (0.0–1.0).
+    pub confidence: f32,
+}
+
+/// Classify a PDF from a memory buffer without extracting text.
+/// Returns the PDF type and which pages need OCR (~10-50ms).
+pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let detection = detector::detect_from_document(&doc, page_count, &DetectionConfig::default())?;
+    Ok(PdfClassification {
+        pdf_type: detection.pdf_type,
+        page_count,
+        // Convert from 1-indexed to 0-indexed for caller convenience
+        pages_needing_ocr: detection.pages_needing_ocr.iter().map(|&p| p - 1).collect(),
+        confidence: detection.confidence,
+    })
+}
+
+/// Extract text within bounding-box regions from a PDF in memory.
+///
+/// This is designed for hybrid OCR pipelines: a layout model detects regions
+/// in a rendered page image, and this function extracts the PDF text that
+/// falls within each region — avoiding GPU OCR for text-based pages.
+///
+/// # Arguments
+///
+/// * `buffer` — PDF file bytes
+/// * `page_regions` — list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
+///   Coordinates are in **PDF points** with **top-left origin** (matching typical
+///   layout model output after coordinate conversion).
+///
+/// # Returns
+///
+/// A `Vec` parallel to `page_regions`, each containing a `Vec<String>` parallel
+/// to that page's region list. Each string is the extracted text within that
+/// region, in reading order (top→bottom, left→right), with lines joined by `\n`.
+pub fn extract_text_in_regions_mem(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<Vec<Vec<String>>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let pages = doc.get_pages();
+
+    // Build a set of pages we need to extract
+    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect(); // to 1-indexed
+
+    // Extract text items for needed pages only
+    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut page_heights: HashMap<u32, f32> = HashMap::new();
+
+    for (page_num, &page_id) in pages.iter() {
+        if !needed_pages.contains(page_num) {
+            continue;
+        }
+
+        // Get page height from MediaBox for coordinate flip
+        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
+        page_heights.insert(*page_num, height);
+
+        // Extract text items for this page
+        let ((mut items, _rects, _lines), _has_gid) =
+            extractor::content_stream::extract_page_text_items(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                false,
+            )?;
+        text_utils::fix_letterspaced_items(&mut items);
+        items_by_page.insert(*page_num, items);
+    }
+
+    // For each page's regions, filter and assemble text
+    let mut results = Vec::with_capacity(page_regions.len());
+
+    for (page_0idx, regions) in page_regions {
+        let page_1idx = page_0idx + 1;
+        let items = items_by_page.get(&page_1idx);
+        let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
+
+        let mut page_results = Vec::with_capacity(regions.len());
+
+        for rect in regions {
+            let [rx1, ry1, rx2, ry2] = *rect;
+
+            let text = match items {
+                Some(items) => collect_text_in_region(items, rx1, ry1, rx2, ry2, page_h),
+                None => String::new(),
+            };
+
+            page_results.push(text);
+        }
+
+        results.push(page_results);
+    }
+
+    Ok(results)
+}
+
+/// Get page height in points from MediaBox.
+fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
+    let page_dict = doc.get_dictionary(page_id).ok()?;
+    // Try MediaBox directly, then follow reference
+    let media_box = page_dict.get(b"MediaBox").ok()?;
+    let arr = match media_box {
+        lopdf::Object::Array(a) => a,
+        lopdf::Object::Reference(r) => {
+            if let Ok(lopdf::Object::Array(a)) = doc.get_object(*r) {
+                a
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if arr.len() >= 4 {
+        let y1 = obj_to_f32(&arr[1])?;
+        let y2 = obj_to_f32(&arr[3])?;
+        Some((y2 - y1).abs())
+    } else {
+        None
+    }
+}
+
+fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
+    match obj {
+        lopdf::Object::Integer(i) => Some(*i as f32),
+        lopdf::Object::Real(f) => Some(*f as f32),
+        _ => None,
+    }
+}
+
+/// Collect text items that fall within a region bbox (top-left origin, PDF points)
+/// and return them as a single string in reading order.
+fn collect_text_in_region(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+) -> String {
+    // Convert region from top-left to bottom-left origin
+    let by1 = page_height - ry2; // top-left y2 → bottom-left y1
+    let by2 = page_height - ry1; // top-left y1 → bottom-left y2
+
+    // Collect items whose center falls within the region
+    let mut matched: Vec<&TextItem> = items
+        .iter()
+        .filter(|item| {
+            let cx = item.x + item.width / 2.0;
+            let cy = item.y + item.height / 2.0;
+            cx >= rx1 && cx <= rx2 && cy >= by1 && cy <= by2
+        })
+        .collect();
+
+    if matched.is_empty() {
+        return String::new();
+    }
+
+    // Sort top→bottom (descending Y in bottom-left coords), then left→right
+    matched.sort_by(|a, b| {
+        let line_threshold = a.font_size.max(b.font_size) * 0.5;
+        let y_diff = b.y - a.y; // descending Y = top to bottom
+        if y_diff.abs() < line_threshold {
+            a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            y_diff
+                .partial_cmp(&0.0_f32)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    // Group into lines and join
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_line = String::new();
+    let mut last_y = f32::NAN;
+    let mut last_x_end = 0.0_f32;
+
+    for item in &matched {
+        let line_threshold = item.font_size * 0.5;
+        let same_line = (item.y - last_y).abs() < line_threshold;
+
+        if !same_line && !current_line.is_empty() {
+            lines.push(current_line.clone());
+            current_line.clear();
+        }
+
+        if !current_line.is_empty() {
+            // Insert space if there's a gap between items on the same line
+            let gap = item.x - last_x_end;
+            if gap > item.font_size * 0.15 {
+                current_line.push(' ');
+            }
+        }
+
+        current_line.push_str(&item.text);
+        last_y = item.y;
+        last_x_end = item.x + item.width;
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    lines.join("\n")
 }
 
 // =========================================================================

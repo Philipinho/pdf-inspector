@@ -2,7 +2,7 @@
 //!
 //! This module extracts text with position information for structure detection.
 
-mod content_stream;
+pub(crate) mod content_stream;
 mod fonts;
 mod layout;
 mod links;
