@@ -1,19 +1,19 @@
 {
-  "name": "@firecrawl/pdf-inspector-js",
-  "version": "0.2.0",
+  "name": "firecrawl-pdf-inspector",
+  "version": "0.2.2",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "*.node"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/firecrawl/pdf-inspector"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com",
     "access": "public"
   },
   "napi": {
@@ -25,10 +25,6 @@
     "package": {
       "name": "@firecrawl/pdf-inspector-js"
     }
-  },
-  "optionalDependencies": {
-    "@firecrawl/pdf-inspector-js-linux-x64-gnu": "0.2.0",
-    "@firecrawl/pdf-inspector-js-darwin-arm64": "0.2.0"
   },
   "scripts": {
     "build": "napi build --platform --release",
