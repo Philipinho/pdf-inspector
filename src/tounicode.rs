@@ -1771,15 +1771,49 @@ impl FontCMaps {
     /// Iterates every page, collects fonts (including Form XObject fonts),
     /// and parses any `/ToUnicode` streams via lopdf's decompression.
     pub fn from_doc(doc: &Document) -> Self {
+        Self::from_doc_pages(doc, None)
+    }
+
+    /// Build FontCMaps for specific pages only. Pass `None` for all pages.
+    pub fn from_doc_pages(doc: &Document, page_filter: Option<&HashSet<u32>>) -> Self {
+        Self::from_doc_pages_inner(doc, page_filter, false)
+    }
+
+    /// Build FontCMaps in fast mode: skip expensive TrueType font fallback
+    /// parsing. Fonts that can't be decoded from their ToUnicode CMap alone
+    /// will be missing, causing text extraction to produce empty/garbage text
+    /// which triggers `needs_ocr` fallback. This is ideal for hybrid OCR
+    /// pipelines where GPU OCR is always available as a fallback.
+    pub fn from_doc_pages_fast(doc: &Document, page_filter: Option<&HashSet<u32>>) -> Self {
+        Self::from_doc_pages_inner(doc, page_filter, true)
+    }
+
+    fn from_doc_pages_inner(
+        doc: &Document,
+        page_filter: Option<&HashSet<u32>>,
+        skip_truetype_fallback: bool,
+    ) -> Self {
         let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
 
-        for (_page_num, &page_id) in doc.get_pages().iter() {
+        for (page_num, &page_id) in doc.get_pages().iter() {
+            if let Some(filter) = page_filter {
+                if !filter.contains(page_num) {
+                    continue;
+                }
+            }
             // Page-level fonts (includes inherited parent resources)
             let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
-            Self::collect_cmaps_from_fonts(&fonts, doc, &mut by_obj_num);
+            Self::collect_cmaps_from_fonts_inner(
+                &fonts,
+                doc,
+                &mut by_obj_num,
+                skip_truetype_fallback,
+            );
 
-            // Fonts inside Form XObjects referenced by this page
-            Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
+            if !skip_truetype_fallback {
+                // Fonts inside Form XObjects referenced by this page
+                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
+            }
         }
 
         FontCMaps { by_obj_num }
@@ -1792,6 +1826,15 @@ impl FontCMaps {
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+    ) {
+        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
+    }
+
+    fn collect_cmaps_from_fonts_inner(
+        fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+        doc: &Document,
+        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        skip_truetype_fallback: bool,
     ) {
         // First pass: collect ToUnicode CMaps
         for font_dict in fonts.values() {
@@ -1825,13 +1868,32 @@ impl FontCMaps {
                 );
                 let (mut primary, mut remapped) =
                     try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-                let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
-                    .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
-                    .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
 
-                // If the ToUnicode map is extremely sparse, prefer the fallback
-                // (often a better mapping for Symbol/Wingdings/Arabic CID fonts).
+                // Only build expensive fallbacks when the primary CMap is sparse.
+                // build_fallback_cmap_for_type0 can take seconds on large embedded
+                // TrueType fonts (decompressing + parsing 100K+ byte font files).
+                // Skip entirely when the primary CMap is sufficient.
                 let primary_entries = primary.char_map.len() + primary.ranges.len();
+                let mut fallback = if primary_entries < 10 && !skip_truetype_fallback {
+                    // Try cheap fallback first; only attempt expensive TrueType
+                    // parsing if cheap fallbacks don't yield results.
+                    let cheap = build_fallback_tounicode_from_encoding(font_dict, doc)
+                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
+                    if cheap.is_some() {
+                        cheap
+                    } else {
+                        build_fallback_cmap_for_type0(font_dict, doc)
+                    }
+                } else if primary_entries < 10 {
+                    // Fast mode: only try cheap fallbacks, skip TrueType parsing.
+                    // Regions using this font will get needs_ocr=true.
+                    build_fallback_tounicode_from_encoding(font_dict, doc)
+                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
+                } else {
+                    // Primary is rich enough; only try the cheap encoding fallback
+                    build_fallback_tounicode_from_encoding(font_dict, doc)
+                };
+
                 if primary_entries < 10 {
                     if let Some(fb) = fallback.take() {
                         debug!(
@@ -1852,8 +1914,12 @@ impl FontCMaps {
                 );
             } else {
                 // ToUnicode present but parse failed; try fallbacks to avoid empty decoding.
-                let fallback = build_fallback_cmap_for_type0(font_dict, doc)
-                    .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
+                let fallback = if skip_truetype_fallback {
+                    build_fallback_cmap_for_simple(font_dict, doc)
+                } else {
+                    build_fallback_cmap_for_type0(font_dict, doc)
+                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
+                };
                 if let Some(fb) = fallback {
                     debug!(
                         "ToUnicode CMap obj={} parse failed; using fallback (entries={})",
@@ -1874,6 +1940,10 @@ impl FontCMaps {
 
         // Second pass: Identity-H/V fonts without ToUnicode
         // Try: (1) embedded TrueType/OpenType cmap, (2) predefined CID→Unicode mapping
+        // Skip entirely in fast mode — these fonts require expensive TrueType parsing.
+        if skip_truetype_fallback {
+            return;
+        }
         for font_dict in fonts.values() {
             if font_dict.get(b"ToUnicode").is_ok() {
                 continue;

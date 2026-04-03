@@ -4,9 +4,11 @@ use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_text, extract_text_with_positions, process_pdf_with_options,
-    to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
+    detect_pdf_type, extract_text, extract_text_in_regions_mem, extract_text_with_positions,
+    process_pdf_mem, process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions,
+    PdfType, TextItem,
 };
+use std::collections::HashSet;
 
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
@@ -1106,4 +1108,190 @@ fn test_rotated_table_layout_correction() {
         has_table_row,
         "District data should be in a markdown table row"
     );
+}
+
+// =========================================================================
+// extract_text_in_regions_mem tests
+// =========================================================================
+
+/// Build full-page region args for `page_count` pages.
+/// Uses a generously large bbox (1200x1200) to capture any page size.
+fn full_page_regions(page_count: u32) -> Vec<(u32, Vec<[f32; 4]>)> {
+    (0..page_count)
+        .map(|p| (p, vec![[0.0, 0.0, 1200.0, 1200.0]]))
+        .collect()
+}
+
+/// Normalize text for comparison: lowercase, strip non-alphanumeric, split into words.
+fn normalize_words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() > 3)
+        .collect()
+}
+
+/// Fraction of normalized words in `a` that also appear in `b`.
+fn word_overlap_ratio(a: &str, b: &str) -> f64 {
+    let words_a = normalize_words(a);
+    if words_a.is_empty() {
+        return if normalize_words(b).is_empty() {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let words_b = normalize_words(b);
+    let overlap = words_a.intersection(&words_b).count();
+    overlap as f64 / words_a.len() as f64
+}
+
+#[test]
+fn test_extract_regions_mem_basic_text_pdf() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+    let page_count = result.page_count;
+
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(page_count)).unwrap();
+    assert_eq!(regions.len(), page_count as usize);
+
+    // Each result should have exactly 1 region (we passed one per page)
+    for r in &regions {
+        assert_eq!(r.regions.len(), 1);
+    }
+
+    // First page should have non-empty text
+    let first = &regions[0].regions[0];
+    assert!(!first.text.trim().is_empty(), "First page should have text");
+    assert_eq!(regions[0].page, 0);
+}
+
+#[test]
+fn test_extract_regions_mem_identity_h_needs_ocr() {
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let regions =
+        extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    assert_eq!(regions.len(), 1);
+    assert!(
+        regions[0].regions[0].needs_ocr,
+        "Identity-H font without ToUnicode should trigger needs_ocr"
+    );
+}
+
+#[test]
+fn test_extract_regions_mem_multiple_regions_per_page() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let regions = extract_text_in_regions_mem(
+        &buf,
+        &[(
+            0,
+            vec![
+                [0.0, 0.0, 300.0, 100.0],   // small top-left
+                [0.0, 0.0, 1200.0, 1200.0], // full page
+            ],
+        )],
+    )
+    .unwrap();
+
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].regions.len(), 2);
+
+    let small_len = regions[0].regions[0].text.len();
+    let full_len = regions[0].regions[1].text.len();
+    assert!(
+        full_len >= small_len,
+        "Full-page region ({full_len}) should have at least as much text as small region ({small_len})"
+    );
+}
+
+#[test]
+fn test_extract_regions_mem_nonexistent_page() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let regions =
+        extract_text_in_regions_mem(&buf, &[(9999, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    assert_eq!(regions.len(), 1);
+    assert!(
+        regions[0].regions[0].needs_ocr,
+        "Nonexistent page should trigger needs_ocr"
+    );
+}
+
+#[test]
+fn test_extract_regions_mem_empty_region() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 0.0, 0.0]])]).unwrap();
+    assert_eq!(regions.len(), 1);
+    assert!(
+        regions[0].regions[0].needs_ocr,
+        "Zero-area region should trigger needs_ocr"
+    );
+}
+
+#[test]
+fn test_extract_regions_mem_not_a_pdf() {
+    let result = extract_text_in_regions_mem(b"not a pdf", &[(0, vec![[0.0, 0.0, 100.0, 100.0]])]);
+    assert!(result.is_err(), "Non-PDF input should return an error");
+}
+
+// =========================================================================
+// Fast vs normal extraction comparison
+// =========================================================================
+
+/// For each text-based fixture PDF, compare `extract_text_in_regions_mem` (fast path)
+/// against `process_pdf_mem` (normal path). If the fast path claims needs_ocr=false
+/// for a page, verify the extracted text has meaningful overlap with the normal
+/// markdown output — catching silent quality regressions.
+#[test]
+fn test_extract_regions_fast_vs_normal_comparison() {
+    let fixtures = [
+        "tests/fixtures/nexo-price-en.pdf",
+        "tests/fixtures/td9264.pdf",
+        "tests/fixtures/p1244-1996.pdf",
+        "tests/fixtures/real-estate-pricing.pdf",
+        "tests/fixtures/2013-app2.pdf",
+        "tests/fixtures/firecrawl_docs_tagged.pdf",
+        "tests/fixtures/thermo-freon12.pdf",
+    ];
+
+    for fixture in &fixtures {
+        let buf = std::fs::read(fixture).unwrap();
+        let normal = process_pdf_mem(&buf).unwrap();
+        let normal_md = normal.markdown.as_deref().unwrap_or("");
+        let page_count = normal.page_count;
+        let ocr_pages: HashSet<u32> = normal.pages_needing_ocr.iter().copied().collect();
+
+        let regions = extract_text_in_regions_mem(&buf, &full_page_regions(page_count)).unwrap();
+
+        assert_eq!(
+            regions.len(),
+            page_count as usize,
+            "{fixture}: result count should match page count"
+        );
+
+        for pr in &regions {
+            let region = &pr.regions[0];
+            if !region.needs_ocr && !region.text.trim().is_empty() {
+                // Fast path claims this text is trustworthy.
+                // Check that its words appear in the normal markdown output.
+                let overlap = word_overlap_ratio(&region.text, normal_md);
+                assert!(
+                    overlap >= 0.3,
+                    "{fixture} page {}: fast path says needs_ocr=false but only {:.0}% word \
+                     overlap with normal extraction (threshold 30%). \
+                     Fast text sample: {:?}",
+                    pr.page,
+                    overlap * 100.0,
+                    &region.text[..region.text.len().min(200)],
+                );
+            }
+
+            // If fast path flags needs_ocr but normal path didn't, that's overly
+            // conservative but not a bug — just worth knowing.
+            if region.needs_ocr && !ocr_pages.contains(&(pr.page + 1)) {
+                eprintln!(
+                    "INFO: {fixture} page {}: fast path says needs_ocr=true but normal path extracted fine (conservative, not a bug)",
+                    pr.page,
+                );
+            }
+        }
+    }
 }

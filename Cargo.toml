@@ -55,5 +55,3 @@ path = "src/bin/detect_pdf.rs"
 [[bin]]
 name = "dump_ops"
 path = "src/bin/dump_ops.rs"
-
-

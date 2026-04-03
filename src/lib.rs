@@ -344,11 +344,15 @@ pub fn extract_text_in_regions_mem(
 ) -> Result<Vec<PageRegionResult>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let font_cmaps = FontCMaps::from_doc(&doc);
     let pages = doc.get_pages();
 
-    // Build a set of pages we need to extract
-    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect(); // to 1-indexed
+    // Build a set of pages we need to extract (1-indexed for lopdf)
+    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
+
+    // Fast mode: skip expensive TrueType font fallback parsing.
+    // Fonts that can't be decoded from ToUnicode alone will produce empty/garbage
+    // text, triggering needs_ocr=true → GPU OCR fallback in the pipeline.
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
 
     // Extract text items for needed pages only
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
@@ -402,6 +406,7 @@ pub fn extract_text_in_regions_mem(
             let needs_ocr = text.trim().is_empty()
                 || page_has_gid
                 || is_garbage_text(&text)
+                || is_cid_garbage(&text)
                 || detect_encoding_issues(&text);
 
             page_results.push(RegionText { text, needs_ocr });
@@ -451,7 +456,7 @@ fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
 
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
-fn collect_text_in_region(
+pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
     ry1: f32,
@@ -478,29 +483,11 @@ fn collect_text_in_region(
     }
 
     // Sort top→bottom (descending Y in bottom-left coords), then left→right.
-    // Uses total_cmp to avoid panics on NaN values from bogus font metrics.
+    // Uses strict total_cmp ordering to guarantee transitivity (required by
+    // Rust's sort). The line-grouping phase below handles fuzzy Y matching.
     matched.sort_by(|a, b| {
-        let fs_a = if a.font_size.is_finite() {
-            a.font_size
-        } else {
-            0.0
-        };
-        let fs_b = if b.font_size.is_finite() {
-            b.font_size
-        } else {
-            0.0
-        };
-        let line_threshold = fs_a.max(fs_b) * 0.5;
-        let ay = if a.y.is_finite() { a.y } else { 0.0 };
-        let by = if b.y.is_finite() { b.y } else { 0.0 };
-        let y_diff = by - ay; // descending Y = top to bottom
-        if y_diff.abs() < line_threshold {
-            let ax = if a.x.is_finite() { a.x } else { 0.0 };
-            let bx = if b.x.is_finite() { b.x } else { 0.0 };
-            ax.total_cmp(&bx)
-        } else {
-            by.total_cmp(&ay)
-        }
+        b.y.total_cmp(&a.y) // descending Y = top to bottom
+            .then(a.x.total_cmp(&b.x)) // ascending X = left to right
     });
 
     // Group into lines and join
