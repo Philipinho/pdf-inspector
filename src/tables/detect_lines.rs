@@ -243,9 +243,11 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
                 .map(|s| (s - mean_spacing).powi(2))
                 .sum::<f32>()
                 / spacings.len() as f32;
-            let cv = variance.sqrt() / mean_spacing; // coefficient of variation
-                                                     // CV < 0.05 means nearly identical spacing — chart grid
-            if cv < 0.05 {
+            let cv = variance.sqrt() / mean_spacing;
+            // CV < 0.02 means nearly identical spacing — likely chart grid.
+            // Spreadsheet-exported tables often have uniform rows (CV 0.03-0.05),
+            // so we use a tighter threshold to avoid false negatives.
+            if cv < 0.02 {
                 return Vec::new();
             }
         }
