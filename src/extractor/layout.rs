@@ -35,6 +35,7 @@ pub(crate) fn detect_columns(
     if page_items.is_empty() {
         return vec![];
     }
+    debug!("page {}: detect_columns: {} items", page, page_items.len());
 
     // Find page bounds
     let x_min = page_items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
@@ -166,6 +167,23 @@ pub(crate) fn detect_columns(
         return vec![ColumnRegion { x_min, x_max }];
     }
 
+    // Try center-based assignment first (handles asymmetric layouts / sidebars
+    // better than edge-based). Fall back to edge-based if center produces
+    // a degenerate split (one side empty).
+    let result = validate_and_build_columns(
+        &valleys,
+        &page_items,
+        x_min,
+        BIN_WIDTH,
+        x_max,
+        MIN_ITEMS_PER_COLUMN,
+        MIN_VERTICAL_SPAN_RATIO,
+        page,
+        true, // center-based assignment
+    );
+    if result.len() > 1 {
+        return result;
+    }
     return validate_and_build_columns(
         &valleys,
         &page_items,
@@ -175,7 +193,7 @@ pub(crate) fn detect_columns(
         MIN_ITEMS_PER_COLUMN,
         MIN_VERTICAL_SPAN_RATIO,
         page,
-        false, // edge-based assignment for absolute valleys
+        false, // edge-based fallback
     );
 }
 
@@ -505,7 +523,15 @@ fn validate_and_build_columns(
             })
             .collect();
 
-        if left_items.len() < min_items || right_items.len() < min_items {
+        // Require both sides to have items. Symmetric layout needs min_items
+        // on each side. Asymmetric layouts (sidebars) are accepted when the
+        // dominant side has ≥ min_items and the smaller side has ≥ 3 items.
+        let (smaller, larger) = if left_items.len() <= right_items.len() {
+            (left_items.len(), right_items.len())
+        } else {
+            (right_items.len(), left_items.len())
+        };
+        if larger < min_items || smaller < 3 {
             continue;
         }
 

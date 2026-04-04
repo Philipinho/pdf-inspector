@@ -601,6 +601,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
+        // Detect columns early — on multi-column pages, the merged-band retry
+        // should skip body-font heuristic table detection (which mistakes column
+        // text for tables). Individual band heuristic detection is left enabled
+        // because bands are scoped to single columns.
+        let page_has_columns = {
+            let cols = crate::extractor::detect_columns(&page_items, page, false);
+            cols.len() >= 2
+        };
+
         // Check for side-by-side layout (e.g. two tables placed left and right)
         let mut bands = split_side_by_side(&page_items);
         // Fallback: use rect hint regions to detect side-by-side layout
@@ -915,7 +924,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 band_items.len(),
                 was_split
             );
-            let heuristic_tables = detect_tables(band_items, base_size, false);
+            let heuristic_tables = detect_tables(band_items, base_size, page_has_columns);
             for table in &heuristic_tables {
                 for &idx in &table.item_indices {
                     if let Some(&page_idx) = band_index_map.get(idx) {
