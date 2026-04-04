@@ -26,19 +26,16 @@ S = Entropy (kJ/kg.K)
 
 **Physical Properties**
 
-Chemical Formula CCl2F2
+|Chemical Formula|CCl2F2|
+|---|---|
+|Molecular mass|120.91|
+|Boiling Point At one atmosphere|-29.75°C|
+|Critical Temperature|111.97°C|
+|Critical Pressure|4136 kPa|
+|Critical Density|565.0 kg/m|
+|Critical Volume|0.0018 m|
 
-Molecular mass 120.91
-
-Boiling Point-29.75°C At one atmosphere
-
-Critical Temperature 111.97°C
-
-Critical Pressure 4136 kPa
-
-3 Critical Density 565.0 kg/m
-
-Critical Volume 0.0018 m /kg
+/kg
 
 l
 

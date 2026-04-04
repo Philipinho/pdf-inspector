@@ -219,7 +219,7 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             body_font_low,
             body_font_high,
         );
-        if body_candidates.len() >= 9 {
+        if body_candidates.len() >= 6 {
             let regions = find_table_regions_strict(&body_candidates);
             log::debug!("body-font: {} strict regions found", regions.len());
 
@@ -241,7 +241,7 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
                     body_candidates.len()
                 );
 
-                if region_items.len() < 9 {
+                if region_items.len() < 6 {
                     continue;
                 }
 
@@ -801,7 +801,25 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
     // Bypass content check for wide tables (3+ columns) — text-only tables
     // (category lists, program descriptions) are legitimate if they passed
     // all structural validations (alignment, consistency, not key-value).
-    pct_data > min_pct || num_cols >= 3
+    // Also bypass for 2-column body-font tables with short cells (avg ≤40 chars),
+    // which are likely definition/category lists, not paragraph text.
+    if pct_data > min_pct || num_cols >= 3 {
+        return true;
+    }
+    if num_cols == 2 && matches!(mode, TableDetectionMode::BodyFont) {
+        let non_empty: Vec<usize> = cells
+            .iter()
+            .skip(1)
+            .flat_map(|row| row.iter())
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| c.trim().len())
+            .collect();
+        if !non_empty.is_empty() {
+            let avg_len = non_empty.iter().sum::<usize>() / non_empty.len();
+            return avg_len <= 25;
+        }
+    }
+    false
 }
 
 /// Check if a cell value looks like table data
