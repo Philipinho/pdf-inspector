@@ -185,6 +185,11 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         .filter(|row| row.iter().any(|cell| !cell.is_empty()))
         .count();
     if non_empty_rows < 2 {
+        log::debug!(
+            "detect_lines p{}: rejected — only {} non-empty rows",
+            page,
+            non_empty_rows
+        );
         return Vec::new();
     }
 
@@ -199,6 +204,11 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
             .count();
         let density = filled_cells as f32 / total_cells as f32;
         if density < 0.15 {
+            log::debug!(
+                "detect_lines p{}: rejected — low density {:.2}",
+                page,
+                density
+            );
             return Vec::new();
         }
     }
@@ -243,9 +253,17 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
                 .map(|s| (s - mean_spacing).powi(2))
                 .sum::<f32>()
                 / spacings.len() as f32;
-            let cv = variance.sqrt() / mean_spacing; // coefficient of variation
-                                                     // CV < 0.05 means nearly identical spacing — chart grid
-            if cv < 0.05 {
+            let cv = variance.sqrt() / mean_spacing;
+            // CV < 0.02 means nearly identical spacing — likely chart grid.
+            // Spreadsheet-exported tables often have uniform rows (CV 0.03-0.05),
+            // so we use a tighter threshold to avoid false negatives.
+            if cv < 0.02 {
+                log::debug!(
+                    "detect_lines p{}: rejected — uniform row spacing (cv={:.4}, mean={:.1})",
+                    page,
+                    cv,
+                    mean_spacing
+                );
                 return Vec::new();
             }
         }

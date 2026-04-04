@@ -751,7 +751,43 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
             if rect_claimed.is_empty() {
-                let line_tables = detect_tables_from_lines(band_items, band_lines, page);
+                // Synthesize PdfLine objects from thin filled rects (border lines
+                // drawn as narrow rectangles instead of stroked paths).
+                let mut augmented_lines: Vec<crate::types::PdfLine> = band_lines.to_vec();
+                for r in band_rects {
+                    let (mut w, mut h) = (r.width, r.height);
+                    let (mut x, mut y) = (r.x, r.y);
+                    if w < 0.0 {
+                        x += w;
+                        w = -w;
+                    }
+                    if h < 0.0 {
+                        y += h;
+                        h = -h;
+                    }
+                    if h < 2.0 && w >= 10.0 {
+                        // Thin horizontal rect → horizontal line
+                        let mid_y = y + h / 2.0;
+                        augmented_lines.push(crate::types::PdfLine {
+                            x1: x,
+                            y1: mid_y,
+                            x2: x + w,
+                            y2: mid_y,
+                            page,
+                        });
+                    } else if w < 2.0 && h >= 10.0 {
+                        // Thin vertical rect → vertical line
+                        let mid_x = x + w / 2.0;
+                        augmented_lines.push(crate::types::PdfLine {
+                            x1: mid_x,
+                            y1: y,
+                            x2: mid_x,
+                            y2: y + h,
+                            page,
+                        });
+                    }
+                }
+                let line_tables = detect_tables_from_lines(band_items, &augmented_lines, page);
                 for table in &line_tables {
                     for &idx in &table.item_indices {
                         rect_claimed.insert(idx);
