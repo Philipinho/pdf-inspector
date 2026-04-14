@@ -29,6 +29,7 @@ pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
+pub mod layout;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
@@ -42,11 +43,14 @@ pub use detector::{
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
 pub use extractor::{extract_text, extract_text_with_positions, extract_text_with_positions_pages};
+pub use layout::detect_layout_regions;
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{
+    BBox, LayoutComplexity, LayoutRegion, PageLayout, PdfLine, PdfRect, RegionType, TextItem,
+};
 
 use lopdf::Document;
 use std::collections::{HashMap, HashSet};
@@ -216,6 +220,34 @@ pub fn process_pdf_mem_with_options(
     let (doc, page_count) = load_document_from_mem(buffer)?;
 
     process_document(doc, page_count, options, start)
+}
+
+// =========================================================================
+// Layout region detection
+// =========================================================================
+
+/// Detect layout regions from a PDF file.
+///
+/// Extracts text positions and runs heuristic region detection (tables,
+/// formulas, images, paragraphs, headings) without generating markdown.
+pub fn detect_layout<P: AsRef<Path>>(path: P) -> Result<Vec<PageLayout>, PdfError> {
+    validate_pdf_file(&path)?;
+    let (doc, _page_count) = load_document_from_path(&path)?;
+    detect_layout_from_doc(&doc)
+}
+
+/// Detect layout regions from a memory buffer.
+pub fn detect_layout_mem(buffer: &[u8]) -> Result<Vec<PageLayout>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    detect_layout_from_doc(&doc)
+}
+
+fn detect_layout_from_doc(doc: &Document) -> Result<Vec<PageLayout>, PdfError> {
+    let font_cmaps = FontCMaps::from_doc(doc);
+    let ((items, rects, lines), _thresholds, _gid_pages) =
+        extractor::extract_positioned_text_from_doc(doc, &font_cmaps, None)?;
+    Ok(layout::detect_layout_regions(&items, &rects, &lines))
 }
 
 // =========================================================================

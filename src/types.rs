@@ -59,6 +59,57 @@ pub enum ItemType {
     FormField,
 }
 
+// ── Layout region types ─────────────────────────────────────────────
+
+/// Type of layout region detected on a page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionType {
+    /// A table (bordered or borderless).
+    Table,
+    /// A mathematical formula or equation.
+    Formula,
+    /// An embedded image.
+    Image,
+    /// A paragraph of body text.
+    Paragraph,
+    /// A heading with a 1-based level.
+    Heading { level: u8 },
+}
+
+/// A bounding box in PDF coordinate space (origin at bottom-left).
+#[derive(Debug, Clone)]
+pub struct BBox {
+    pub x_min: f32,
+    pub y_min: f32,
+    pub x_max: f32,
+    pub y_max: f32,
+}
+
+/// A detected layout region on a page.
+#[derive(Debug, Clone)]
+pub struct LayoutRegion {
+    /// Bounding box in PDF points (bottom-left origin).
+    pub bbox: BBox,
+    /// The type of content in this region.
+    pub region_type: RegionType,
+    /// 1-indexed page number.
+    pub page: u32,
+    /// Detection confidence (0.0–1.0).
+    pub confidence: f32,
+    /// Whether an orchestrator should send this region to OCR
+    /// rather than using native text extraction.
+    pub needs_ocr: bool,
+}
+
+/// Per-page layout detection result.
+#[derive(Debug, Clone)]
+pub struct PageLayout {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// Detected regions, sorted top-to-bottom then left-to-right.
+    pub regions: Vec<LayoutRegion>,
+}
+
 /// Layout complexity analysis result.
 ///
 /// Callers can use this to decide whether the extracted markdown is reliable

@@ -1,6 +1,9 @@
 //! CLI tool for PDF to Markdown conversion
 
-use pdf_inspector::{process_pdf_with_options, LayoutComplexity, PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::{
+    detect_layout, process_pdf_with_options, LayoutComplexity, PdfOptions, PdfType, ProcessMode,
+    RegionType,
+};
 use std::collections::HashSet;
 use std::env;
 use std::fmt::Write;
@@ -100,6 +103,7 @@ fn main() {
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
         eprintln!("  --detect-only       Only detect PDF type (no extraction)");
         eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
+        eprintln!("  --layout            Detect layout regions (tables, formulas, images, text)");
         process::exit(1);
     }
 
@@ -109,6 +113,7 @@ fn main() {
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
+    let layout_mode = args.iter().any(|a| a == "--layout");
 
     // Parse --select-pages value
     let page_filter = args
@@ -146,6 +151,28 @@ fn main() {
     options.markdown.include_page_numbers = page_numbers;
     if let Some(pages) = page_filter {
         options.page_filter = Some(pages);
+    }
+
+    // Layout region detection mode
+    if layout_mode {
+        match detect_layout(pdf_path) {
+            Ok(pages) => {
+                if json_output {
+                    print_layout_json(&pages);
+                } else {
+                    print_layout_text(&pages);
+                }
+            }
+            Err(e) => {
+                if json_output {
+                    println!(r#"{{"error":"{}"}}"#, e);
+                } else {
+                    eprintln!("Error: {}", e);
+                }
+                process::exit(1);
+            }
+        }
+        return;
     }
 
     match process_pdf_with_options(pdf_path, options) {
@@ -338,6 +365,69 @@ fn main() {
                 eprintln!("Error: {}", e);
             }
             process::exit(1);
+        }
+    }
+}
+
+fn region_type_str(rt: &RegionType) -> &'static str {
+    match rt {
+        RegionType::Table => "table",
+        RegionType::Formula => "formula",
+        RegionType::Image => "image",
+        RegionType::Paragraph => "paragraph",
+        RegionType::Heading { .. } => "heading",
+    }
+}
+
+fn print_layout_json(pages: &[pdf_inspector::PageLayout]) {
+    let mut out = String::from(r#"{"pages":["#);
+    for (pi, page) in pages.iter().enumerate() {
+        if pi > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, r#"{{"page":{},"regions":["#, page.page);
+        for (ri, r) in page.regions.iter().enumerate() {
+            if ri > 0 {
+                out.push(',');
+            }
+            let type_str = region_type_str(&r.region_type);
+            let _ = write!(out, r#"{{"type":"{}""#, type_str,);
+            if let RegionType::Heading { level } = r.region_type {
+                let _ = write!(out, r#","level":{}"#, level);
+            }
+            let _ = write!(
+                out,
+                r#","bbox":{{"x_min":{:.1},"y_min":{:.1},"x_max":{:.1},"y_max":{:.1}}},"confidence":{:.2},"needs_ocr":{}}}"#,
+                r.bbox.x_min, r.bbox.y_min, r.bbox.x_max, r.bbox.y_max, r.confidence, r.needs_ocr,
+            );
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+    println!("{}", out);
+}
+
+fn print_layout_text(pages: &[pdf_inspector::PageLayout]) {
+    for page in pages {
+        eprintln!("Page {}:", page.page);
+        for r in &page.regions {
+            let type_str = region_type_str(&r.region_type);
+            let level_suffix = if let RegionType::Heading { level } = r.region_type {
+                format!(" (H{})", level)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "  {}{} [{:.0},{:.0} - {:.0},{:.0}] conf={:.2} ocr={}",
+                type_str,
+                level_suffix,
+                r.bbox.x_min,
+                r.bbox.y_min,
+                r.bbox.x_max,
+                r.bbox.y_max,
+                r.confidence,
+                r.needs_ocr,
+            );
         }
     }
 }
