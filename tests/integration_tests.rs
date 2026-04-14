@@ -1445,55 +1445,56 @@ fn test_extract_tables_in_regions_nonexistent_page() {
 #[test]
 fn test_extract_pages_markdown_basic() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let results = extract_pages_markdown_mem(&buf, &[0, 1]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, &[0, 1]).unwrap();
 
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].page, 0);
-    assert_eq!(results[1].page, 1);
+    assert_eq!(result.pages.len(), 2);
+    assert_eq!(result.pages[0].page, 0);
+    assert_eq!(result.pages[1].page, 1);
     // Text-based PDF should produce non-empty markdown
-    assert!(!results[0].markdown.is_empty());
-    assert!(!results[0].needs_ocr);
+    assert!(!result.pages[0].markdown.is_empty());
+    assert!(!result.pages[0].needs_ocr);
 }
 
 #[test]
 fn test_extract_pages_markdown_page_ordering() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     // Request pages in non-sequential order
-    let results = extract_pages_markdown_mem(&buf, &[1, 0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, &[1, 0]).unwrap();
 
-    assert_eq!(results.len(), 2);
+    assert_eq!(result.pages.len(), 2);
     // Results should match input order, not document order
-    assert_eq!(results[0].page, 1);
-    assert_eq!(results[1].page, 0);
+    assert_eq!(result.pages[0].page, 1);
+    assert_eq!(result.pages[1].page, 0);
 }
 
 #[test]
 fn test_extract_pages_markdown_out_of_range() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let results = extract_pages_markdown_mem(&buf, &[9999]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, &[9999]).unwrap();
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].page, 9999);
-    assert!(results[0].markdown.is_empty());
-    assert!(results[0].needs_ocr);
+    assert_eq!(result.pages.len(), 1);
+    assert_eq!(result.pages[0].page, 9999);
+    assert!(result.pages[0].markdown.is_empty());
+    assert!(result.pages[0].needs_ocr);
+    assert!(result.pages_needing_ocr.contains(&10000)); // 1-indexed
 }
 
 #[test]
 fn test_extract_pages_markdown_empty_pages_list() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let results = extract_pages_markdown_mem(&buf, &[]).unwrap();
-    assert!(results.is_empty());
+    let result = extract_pages_markdown_mem(&buf, &[]).unwrap();
+    assert!(result.pages.is_empty());
 }
 
 #[test]
 fn test_extract_pages_markdown_single_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let results = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].page, 0);
-    assert!(!results[0].markdown.is_empty());
-    assert!(!results[0].needs_ocr);
+    assert_eq!(result.pages.len(), 1);
+    assert_eq!(result.pages[0].page, 0);
+    assert!(!result.pages[0].markdown.is_empty());
+    assert!(!result.pages[0].needs_ocr);
 }
 
 #[test]
@@ -1506,10 +1507,55 @@ fn test_extract_pages_markdown_invalid_buffer() {
 fn test_extract_pages_markdown_gid_pages_need_ocr() {
     // shinagawa_identity_h.pdf has GID-encoded fonts
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
-    let results = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
 
-    assert_eq!(results.len(), 1);
-    assert!(results[0].needs_ocr);
+    assert_eq!(result.pages.len(), 1);
+    assert!(result.pages[0].needs_ocr);
+    assert!(result.pages_needing_ocr.contains(&1)); // 1-indexed
+}
+
+#[test]
+fn test_extract_pages_markdown_classification_with_tables() {
+    // nexo-price-en.pdf is known to have tables
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let page_count = process_pdf_mem(&buf).unwrap().page_count;
+    let page_indices: Vec<u32> = (0..page_count).collect();
+    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+
+    assert!(
+        !result.pages_with_tables.is_empty(),
+        "nexo-price-en.pdf should have pages with tables"
+    );
+    assert!(result.is_complex);
+}
+
+#[test]
+fn test_extract_pages_markdown_simple_pdf_no_complexity() {
+    // bare_name_struct.pdf is a simple document with a heading and code block
+    let buf = std::fs::read("tests/fixtures/bare_name_struct.pdf").unwrap();
+    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+
+    assert!(result.pages_with_tables.is_empty());
+    assert!(result.pages_with_columns.is_empty());
+    assert!(!result.is_complex);
+}
+
+#[test]
+fn test_extract_pages_markdown_classification_matches_process_pdf() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let full = process_pdf_mem(&buf).unwrap();
+    let page_count = full.page_count;
+    let page_indices: Vec<u32> = (0..page_count).collect();
+    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+
+    assert_eq!(
+        result.pages_with_tables, full.layout.pages_with_tables,
+        "pages_with_tables should match process_pdf"
+    );
+    assert_eq!(
+        result.pages_with_columns, full.layout.pages_with_columns,
+        "pages_with_columns should match process_pdf"
+    );
 }
 
 #[test]
@@ -1523,12 +1569,13 @@ fn test_extract_pages_markdown_consistency_with_process_pdf() {
     // Get per-page output for all pages
     let page_count = full.page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let per_page = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
 
     // Concatenated per-page markdown should contain substantial overlap with
     // the full output (exact match not expected due to header/footer stripping
     // and cross-page paragraph merging differences)
-    let concat: String = per_page
+    let concat: String = result
+        .pages
         .iter()
         .map(|p| p.markdown.as_str())
         .collect::<Vec<_>>()

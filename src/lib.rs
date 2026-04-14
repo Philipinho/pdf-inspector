@@ -315,7 +315,23 @@ pub struct PageMarkdown {
     pub needs_ocr: bool,
 }
 
-/// Extract formatted markdown for specific pages of a PDF.
+/// Combined per-page markdown extraction and layout classification result.
+#[derive(Debug)]
+pub struct PagesExtractionResult {
+    /// Per-page markdown results.
+    pub pages: Vec<PageMarkdown>,
+    /// 1-indexed pages where tables were detected.
+    pub pages_with_tables: Vec<u32>,
+    /// 1-indexed pages where multi-column layout was detected.
+    pub pages_with_columns: Vec<u32>,
+    /// 1-indexed pages that need OCR (scanned/image-based).
+    pub pages_needing_ocr: Vec<u32>,
+    /// True if any page has tables or columns.
+    pub is_complex: bool,
+}
+
+/// Extract formatted markdown for specific pages of a PDF, with layout
+/// classification metadata.
 ///
 /// Unlike [`process_pdf_mem`] which returns one concatenated markdown string,
 /// this returns per-page markdown so callers can mix direct extraction
@@ -325,26 +341,34 @@ pub struct PageMarkdown {
 /// detection thresholds are consistent regardless of which pages are
 /// requested. Per-page `needs_ocr` is set when the page has GID-encoded
 /// fonts, encoding issues, or garbage text.
+///
+/// Layout complexity (tables, columns) is computed from the full document
+/// at near-zero cost since the items/rects/lines are already in memory.
 pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: &[u32],
-) -> Result<Vec<PageMarkdown>, PdfError> {
+) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats.
-    let ((all_items, all_rects, _all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
         extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
+
+    // Compute layout complexity from full document (near-zero cost).
+    let complexity = compute_layout_complexity(&all_items, &all_rects, &all_lines);
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&all_items);
 
     let mut results = Vec::with_capacity(pages.len());
+    let mut pages_needing_ocr = Vec::new();
 
     for &page_0idx in pages {
         // Out-of-range pages → empty + needs_ocr
         if page_0idx >= page_count {
+            pages_needing_ocr.push(page_0idx + 1);
             results.push(PageMarkdown {
                 page: page_0idx,
                 markdown: String::new(),
@@ -394,6 +418,10 @@ pub fn extract_pages_markdown_mem(
             || is_cid_garbage(&md)
             || detect_encoding_issues(&md);
 
+        if needs_ocr {
+            pages_needing_ocr.push(page_1idx);
+        }
+
         results.push(PageMarkdown {
             page: page_0idx,
             markdown: if needs_ocr { String::new() } else { md },
@@ -401,7 +429,13 @@ pub fn extract_pages_markdown_mem(
         });
     }
 
-    Ok(results)
+    Ok(PagesExtractionResult {
+        pages: results,
+        pages_with_tables: complexity.pages_with_tables,
+        pages_with_columns: complexity.pages_with_columns,
+        pages_needing_ocr,
+        is_complex: complexity.is_complex,
+    })
 }
 
 // =========================================================================

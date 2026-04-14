@@ -328,27 +328,51 @@ pub struct PageMarkdownResult {
     pub needs_ocr: bool,
 }
 
-/// Extract formatted markdown for specific pages of a PDF.
+/// Combined per-page markdown extraction and layout classification result.
+#[napi(object)]
+pub struct PagesExtractionResult {
+    /// Per-page markdown results.
+    pub pages: Vec<PageMarkdownResult>,
+    /// 1-indexed pages where tables were detected.
+    pub pages_with_tables: Vec<u32>,
+    /// 1-indexed pages where multi-column layout was detected.
+    pub pages_with_columns: Vec<u32>,
+    /// 1-indexed pages that need OCR (scanned/image-based).
+    pub pages_needing_ocr: Vec<u32>,
+    /// True if any page has tables or columns.
+    pub is_complex: bool,
+}
+
+/// Extract formatted markdown for specific pages of a PDF, with layout
+/// classification metadata.
 ///
-/// Returns per-page markdown so callers can mix direct extraction
-/// (for simple text pages) with GPU OCR (for complex/scanned pages).
-///
-/// Font statistics are computed from the full document so header
-/// detection is consistent across pages.
+/// Returns per-page markdown and classification data (tables, columns,
+/// OCR needs) from a single parse. Font statistics are computed from the
+/// full document so header detection is consistent across pages.
 #[napi]
-pub fn extract_pages_markdown(buffer: Buffer, pages: Vec<u32>) -> Result<Vec<PageMarkdownResult>> {
+pub fn extract_pages_markdown(
+    buffer: Buffer,
+    pages: Vec<u32>,
+) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
-        let results = pdf_inspector::extract_pages_markdown_mem(&bytes, &pages)
+        let result = pdf_inspector::extract_pages_markdown_mem(&bytes, &pages)
             .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
-        Ok(results
-            .into_iter()
-            .map(|r| PageMarkdownResult {
-                page: r.page,
-                markdown: r.markdown,
-                needs_ocr: r.needs_ocr,
-            })
-            .collect())
+        Ok(PagesExtractionResult {
+            pages: result
+                .pages
+                .into_iter()
+                .map(|r| PageMarkdownResult {
+                    page: r.page,
+                    markdown: r.markdown,
+                    needs_ocr: r.needs_ocr,
+                })
+                .collect(),
+            pages_with_tables: result.pages_with_tables,
+            pages_with_columns: result.pages_with_columns,
+            pages_needing_ocr: result.pages_needing_ocr,
+            is_complex: result.is_complex,
+        })
     })
 }
 
