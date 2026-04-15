@@ -197,13 +197,14 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
                 analysis.total_image_area, analysis.has_identity_h_no_tounicode,
-                analysis.has_only_type3_fonts, analysis.font_change_count
+                analysis.has_only_type3_fonts, analysis.font_change_count,
+                analysis.has_decodable_text_fonts
             );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
@@ -227,10 +228,15 @@ pub(crate) fn detect_from_document(
             // (single full-page image) rather than a text page with figures.
             // Scanned-with-OCR PDFs have 1 large image per page + OCR text overlay;
             // text PDFs with figures have multiple smaller images alongside real text.
+            //
+            // Exception: CID-encoded fonts with ToUnicode produce low
+            // unique_alphanum_chars in raw bytes but are fully decodable.
+            // When a page has decodable fonts and enough text ops, treat it
+            // as having real text regardless of raw byte diversity.
+            let alphanum_ok = analysis.unique_alphanum_chars < 10
+                && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
             if analysis.has_template_image
-                && (analysis.image_count <= 1
-                    && analysis.text_operator_count < 50
-                    && analysis.unique_alphanum_chars < 10)
+                && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok)
             {
                 pages_with_template_images += 1;
             }
@@ -360,9 +366,12 @@ pub(crate) fn detect_from_document(
                 };
                 // Template images only need OCR when it looks like a scan
                 // (single full-page image) rather than figures alongside text.
-                let looks_like_scan = analysis.image_count <= 1
-                    && analysis.text_operator_count < 50
-                    && analysis.unique_alphanum_chars < 10;
+                // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars
+                // in raw bytes but are fully decodable — don't treat as scan.
+                let alphanum_low = analysis.unique_alphanum_chars < 10
+                    && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
+                let looks_like_scan =
+                    analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_low;
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
                     || (analysis.text_operator_count < config.min_text_ops_per_page
@@ -485,6 +494,11 @@ struct PageAnalysis {
     has_only_type3_fonts: bool,
     /// Number of Tf (set font) operators — high count indicates many font switches
     font_change_count: u32,
+    /// Whether the page has fonts that can produce decodable text (ToUnicode,
+    /// standard encoding, Type1/TrueType with known encoding).
+    /// CID-encoded text with ToUnicode produces low unique_alphanum_chars in raw
+    /// bytes but is fully decodable — this flag prevents misclassifying it as a scan.
+    has_decodable_text_fonts: bool,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -550,15 +564,21 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_images = true;
     }
 
-    // Vector-outlined text: massive path ops with minimal text ops.
-    // Each outlined glyph needs ~10-30 path commands, so a page of
-    // outlined text produces thousands of path ops.
-    let has_vector_text = path_ops >= 1000 && path_ops > text_ops.saturating_mul(200);
-
     let unique_alphanum_chars = all_unique_chars
         .iter()
         .filter(|b| b.is_ascii_alphanumeric())
         .count() as u32;
+
+    // Vector-outlined text: massive path ops with minimal text ops.
+    // Each outlined glyph needs ~10-30 path commands, so a page of
+    // outlined text produces thousands of path ops.
+    //
+    // Also require few unique alphanum chars: real outlined-text pages have
+    // very few because each glyph is a path, not a Tj/TJ text op. Pages with
+    // real selectable text plus decorative paths (column borders, dividers)
+    // have many unique alphanum chars — these are NOT vector-outlined text.
+    let has_vector_text =
+        path_ops >= 1000 && path_ops > text_ops.saturating_mul(200) && unique_alphanum_chars < 30;
 
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text
     let has_identity_h_no_tounicode =
@@ -566,6 +586,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     // Check for Type3-only fonts — glyph bitmaps without Unicode mapping
     let has_only_type3_fonts = text_ops > 0 && page_has_only_type3_fonts(doc, page_id);
+
+    // Check if the page has fonts that can decode text to Unicode.
+    // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
+    // bytes but are fully decodable — we need this to avoid false scan detection.
+    let has_decodable_text_fonts = text_ops > 0 && page_has_decodable_text_fonts(doc, page_id);
 
     PageAnalysis {
         text_operator_count: text_ops,
@@ -580,57 +605,83 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_identity_h_no_tounicode,
         has_only_type3_fonts,
         font_change_count: font_changes,
+        has_decodable_text_fonts,
     }
 }
 
 /// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
 /// These fonts encode text as raw CID values that can't be mapped to Unicode without
 /// a ToUnicode CMap, producing garbage output for non-Latin scripts (e.g. Cyrillic).
+///
+/// Returns false when the page also has other decodable text fonts (Type1, TrueType,
+/// or Type0 with ToUnicode/fallback). In that case the undecodable Identity-H font
+/// is supplementary and the page has enough good text for extraction.
 fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
         Err(_) => return false,
     };
+
+    let mut has_undecodable_identity_h = false;
+    let mut has_other_decodable_font = false;
+
     for font_dict in fonts.values() {
         let subtype = font_dict
             .get(b"Subtype")
             .ok()
             .and_then(|o| o.as_name().ok());
-        if subtype != Some(b"Type0") {
-            continue;
-        }
-        let encoding = font_dict
-            .get(b"Encoding")
-            .ok()
-            .and_then(|o| o.as_name().ok());
-        let is_identity = matches!(encoding, Some(b"Identity-H") | Some(b"Identity-V"));
-        if !is_identity {
-            continue;
-        }
-        // Has ToUnicode? Then the font is decodable.
-        if font_dict.get(b"ToUnicode").is_ok() {
-            continue;
-        }
 
-        // Check if fallback decoding paths can handle this font.
-        // The extraction pipeline tries: TrueType cmap → CIDSystemInfo → passthrough.
-        // If any of these would succeed, the font is decodable — don't flag it.
-        if identity_h_font_has_fallback(font_dict, doc) {
-            continue;
-        }
+        match subtype {
+            Some(b"Type0") => {
+                let encoding = font_dict
+                    .get(b"Encoding")
+                    .ok()
+                    .and_then(|o| o.as_name().ok());
+                let is_identity = matches!(encoding, Some(b"Identity-H") | Some(b"Identity-V"));
 
-        // Identity-H/V without ToUnicode and no fallback — flag it
-        log::debug!(
-            "page has Identity-H/V font without ToUnicode: {:?}",
-            font_dict
-                .get(b"BaseFont")
-                .ok()
-                .and_then(|o| o.as_name().ok())
-                .map(|n| String::from_utf8_lossy(n).to_string())
-        );
-        return true;
+                if !is_identity {
+                    // Type0 with non-Identity encoding (e.g. a named CMap) — decodable
+                    has_other_decodable_font = true;
+                    continue;
+                }
+                if font_dict.get(b"ToUnicode").is_ok() {
+                    // Has ToUnicode — decodable
+                    has_other_decodable_font = true;
+                    continue;
+                }
+                if identity_h_font_has_fallback(font_dict, doc) {
+                    // Fallback decoding path works — decodable
+                    has_other_decodable_font = true;
+                    continue;
+                }
+
+                // Identity-H/V without ToUnicode and no fallback — undecodable
+                log::debug!(
+                    "page has Identity-H/V font without ToUnicode: {:?}",
+                    font_dict
+                        .get(b"BaseFont")
+                        .ok()
+                        .and_then(|o| o.as_name().ok())
+                        .map(|n| String::from_utf8_lossy(n).to_string())
+                );
+                has_undecodable_identity_h = true;
+            }
+            Some(b"Type3") => {
+                // Type3 fonts are handled separately by page_has_only_type3_fonts;
+                // don't count them as decodable here.
+            }
+            _ => {
+                // Type1, TrueType, MMType1, CIDFontType0/2 — these are generally
+                // decodable via standard encoding, ToUnicode, or glyph name lookup.
+                has_other_decodable_font = true;
+            }
+        }
     }
-    false
+
+    // Only flag when there are undecodable Identity-H fonts AND no other
+    // decodable fonts on the page. If the page has other text fonts, the
+    // Identity-H font is supplementary and the page still extracts well.
+    has_undecodable_identity_h && !has_other_decodable_font
 }
 
 /// Check whether an Identity-H font without ToUnicode can still be decoded
@@ -761,6 +812,48 @@ fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
         log::debug!("page has only Type3 fonts without ToUnicode — text is undecodable");
     }
     has_type3
+}
+
+/// Check if the page has at least one font that can produce decodable Unicode text.
+///
+/// Returns true when any font on the page has:
+/// - A /ToUnicode CMap (works for all font types including CID fonts), OR
+/// - A standard /Encoding (WinAnsiEncoding, MacRomanEncoding, etc.) for Type1/TrueType, OR
+/// - Is a Type1 or TrueType font (these use glyph names → Adobe Glyph List fallback)
+///
+/// This distinguishes pages with CID-encoded text that IS decodable (via ToUnicode)
+/// from scanned pages that happen to have a few decorative text ops. CID text produces
+/// low unique_alphanum_chars in raw bytes but can map to full Unicode through ToUnicode.
+fn page_has_decodable_text_fonts(doc: &Document, page_id: ObjectId) -> bool {
+    let fonts = match doc.get_page_fonts(page_id) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    for font_dict in fonts.values() {
+        // Any font with ToUnicode is decodable
+        if font_dict.get(b"ToUnicode").is_ok() {
+            return true;
+        }
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        match subtype {
+            Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => {
+                // Type1/TrueType with a named encoding or glyph names are decodable
+                // via the Adobe Glyph List or encoding vectors.
+                return true;
+            }
+            Some(b"Type0") => {
+                // Type0 (CID) without ToUnicode — check if it has a fallback path
+                if identity_h_font_has_fallback(font_dict, doc) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn scan_xobjects_in_resources(
