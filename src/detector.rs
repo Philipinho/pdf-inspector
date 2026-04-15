@@ -604,6 +604,60 @@ fn resolve_font_names_to_ids(
     }
 }
 
+/// Look up a single font name in a resource dictionary, returning its indirect
+/// ObjectId if present.
+fn lookup_font_id(
+    doc: &Document,
+    resources: &lopdf::Dictionary,
+    font_name: &[u8],
+) -> Option<ObjectId> {
+    let font_obj = resources.get(b"Font").ok()?;
+    let font_dict = match font_obj {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(r) => doc.get_dictionary(*r).ok(),
+        _ => None,
+    }?;
+    if let Ok(Object::Reference(r)) = font_dict.get(font_name) {
+        Some(*r)
+    } else {
+        None
+    }
+}
+
+/// Resolve page-level font names with PDF resource inheritance shadowing.
+///
+/// PDF spec (ISO 32000-1, 7.7.3.4): a page inherits /Resources from its
+/// parent /Pages nodes, but a definition in a more-specific scope shadows
+/// the same name from an ancestor. lopdf's `get_page_resources` returns
+/// ancestors in most-specific-first order (page → parent → grandparent),
+/// so the first dictionary that defines a given font name wins.
+fn resolve_with_shadowing(
+    doc: &Document,
+    own_resources: Option<&lopdf::Dictionary>,
+    ancestor_resource_ids: &[ObjectId],
+    names: &HashSet<Vec<u8>>,
+    used_font_ids: &mut HashSet<ObjectId>,
+) {
+    'name: for name in names {
+        // Check page's own inline /Resources first (most specific scope)
+        if let Some(rd) = own_resources {
+            if let Some(id) = lookup_font_id(doc, rd, name) {
+                used_font_ids.insert(id);
+                continue 'name;
+            }
+        }
+        // Walk inherited resource dicts (most-specific to root); first hit wins
+        for ancestor_id in ancestor_resource_ids {
+            if let Ok(rd) = doc.get_dictionary(*ancestor_id) {
+                if let Some(id) = lookup_font_id(doc, rd, name) {
+                    used_font_ids.insert(id);
+                    continue 'name;
+                }
+            }
+        }
+    }
+}
+
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut text_ops = 0u32;
@@ -649,21 +703,17 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
             font_changes += fonts;
             has_images = has_images || imgs > 0;
 
-            // Resolve font names against the page's resource dictionaries
+            // Resolve font names against the page's resource dictionaries,
+            // respecting PDF resource inheritance shadowing: the most-specific
+            // scope (page's own /Resources) wins over inherited ancestors.
             if let Some((ref resource_dict, ref resource_ids)) = page_resources {
-                if let Some(resources) = resource_dict {
-                    resolve_font_names_to_ids(doc, resources, &page_font_names, &mut used_font_ids);
-                }
-                for resource_id in resource_ids {
-                    if let Ok(resources) = doc.get_dictionary(*resource_id) {
-                        resolve_font_names_to_ids(
-                            doc,
-                            resources,
-                            &page_font_names,
-                            &mut used_font_ids,
-                        );
-                    }
-                }
+                resolve_with_shadowing(
+                    doc,
+                    *resource_dict,
+                    resource_ids,
+                    &page_font_names,
+                    &mut used_font_ids,
+                );
             }
         }
     }
@@ -3260,6 +3310,205 @@ mod tests {
         assert!(
             analysis.has_decodable_text_fonts,
             "P1+P2 combined: should detect decodable font from indirect XObject Resources"
+        );
+    }
+
+    // ---------- P3 tests: resource inheritance shadowing ----------
+
+    #[test]
+    fn test_p3_page_overrides_parent_font_undecodable_shadows_decodable() {
+        // Page tree: /Pages root has /Resources with /F1 → decodable Type1.
+        // Page itself has /Resources with /F1 → undecodable Identity-H.
+        // Content uses /F1. The page's /F1 shadows the parent's /F1.
+        // Expectation: MUST be flagged (only the undecodable font is "used").
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Parent's /F1: decodable Type1 (SHADOWED — should NOT be in used set)
+        let parent_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let parent_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(parent_font_id),
+            },
+        }));
+
+        // Page's /F1: undecodable Identity-H (no ToUnicode, no fallback)
+        let page_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+BadFont".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+
+        let content_data = b"BT /F1 12 Tf <0102030405> Tj ET";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(page_font_id),
+                    },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+                "Resources" => Object::Reference(parent_resources_id),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_identity_h_no_tounicode,
+            "P3: page /F1 (undecodable) shadows parent /F1 (decodable) — \
+             must be flagged for OCR"
+        );
+    }
+
+    #[test]
+    fn test_p3_page_overrides_parent_font_decodable_shadows_undecodable() {
+        // Inverse: page /F1 → decodable Type1, parent /F1 → undecodable Identity-H.
+        // Content uses /F1. The page's decodable font shadows the parent's bad one.
+        // Expectation: MUST NOT be flagged.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Parent's /F1: undecodable Identity-H (SHADOWED — should NOT be in used set)
+        let parent_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+BadFont".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let parent_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(parent_font_id),
+            },
+        }));
+
+        // Page's /F1: decodable Type1
+        let page_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        let content_data = b"BT /F1 12 Tf (Hello world) Tj ET";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(page_font_id),
+                    },
+                },
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+                "Resources" => Object::Reference(parent_resources_id),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "P3: page /F1 (decodable) shadows parent /F1 (undecodable) — \
+             must NOT be flagged for OCR"
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P3: page's decodable font should be detected as used"
+        );
+    }
+
+    #[test]
+    fn test_p3_inheritance_without_override_uses_parent_font() {
+        // Page has NO /F1 in its own /Resources. Parent has /F1 → decodable.
+        // Content uses /F1. Should inherit the parent's font.
+        // Expectation: MUST NOT be flagged.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Parent's /F1: decodable Type1
+        let parent_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        let parent_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(parent_font_id),
+            },
+        }));
+
+        let content_data = b"BT /F1 12 Tf (Hello world) Tj ET";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+
+        // Page has NO own /Resources — inherits everything from parent
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+                "Resources" => Object::Reference(parent_resources_id),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "P3: page inherits parent's decodable /F1 — must NOT be flagged"
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P3: inherited decodable font should be detected as used"
         );
     }
 }
