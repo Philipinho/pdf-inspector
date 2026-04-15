@@ -1836,4 +1836,317 @@ mod tests {
             "multiple images page should not match single-image scan pattern"
         );
     }
+
+    // ---------- Tests for has_vector_text alphanum guard ----------
+
+    #[test]
+    fn test_has_vector_text_real_text_with_decorations_not_flagged() {
+        // Newspaper-style page: high path_ops (column borders/dividers/decorations)
+        // BUT also lots of selectable real text → high unique_alphanum_chars.
+        // Should NOT trigger has_vector_text — the paths are decorations, not glyphs.
+        let path_ops = 8354u32;
+        let text_ops = 41u32;
+        let unique_alphanum_chars = 53u32;
+        let has_vector_text = path_ops >= 1000
+            && path_ops > text_ops.saturating_mul(200)
+            && unique_alphanum_chars < 30;
+        assert!(
+            !has_vector_text,
+            "page with real selectable text alongside decorative paths should not be vector_text"
+        );
+    }
+
+    #[test]
+    fn test_has_vector_text_outlined_glyphs_still_flagged() {
+        // True outlined-text page: massive path_ops, very few unique alphanum chars
+        // (each char is a path, not a Tj op). MUST still flag as vector_text.
+        let path_ops = 8000u32;
+        let text_ops = 5u32;
+        let unique_alphanum_chars = 4u32;
+        let has_vector_text = path_ops >= 1000
+            && path_ops > text_ops.saturating_mul(200)
+            && unique_alphanum_chars < 30;
+        assert!(
+            has_vector_text,
+            "true outlined-text page should still be flagged as vector_text"
+        );
+    }
+
+    // ---------- Tests for page_has_identity_h_no_tounicode supplementary-font handling ----------
+
+    #[test]
+    fn test_identity_h_with_supplementary_decodable_font_not_flagged() {
+        // Page has TWO fonts: an undecodable Identity-H Type0 (supplementary,
+        // e.g. a decorative font for headers) AND a Type1 font with ToUnicode
+        // (carries the body text). Should NOT flag — body text is decodable.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Undecodable Identity-H: no ToUnicode, no W array → no fallback.
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Cosmos-Medium".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+
+        // Decodable Type1 with ToUnicode: typical body-text font.
+        let cmap_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"fake cmap".to_vec(),
+        )));
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+                "F2" => Object::Reference(good_font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        assert!(
+            !page_has_identity_h_no_tounicode(&doc, page_id),
+            "page with supplementary undecodable Identity-H but decodable Type1 should not flag"
+        );
+    }
+
+    #[test]
+    fn test_identity_h_with_no_other_fonts_still_flagged() {
+        // Regression check: page with ONLY the undecodable Identity-H font
+        // (no other decodable text font) MUST still flag for OCR.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Cosmos-Medium".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(
+            page_has_identity_h_no_tounicode(&doc, page_id),
+            "page with only undecodable Identity-H must still be flagged"
+        );
+    }
+
+    // ---------- Tests for page_has_decodable_text_fonts ----------
+
+    #[test]
+    fn test_page_has_decodable_text_fonts_type1() {
+        // Type1 font (no ToUnicode required — uses Adobe Glyph List)
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Times-Roman".to_vec()),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(page_has_decodable_text_fonts(&doc, page_id));
+    }
+
+    #[test]
+    fn test_page_has_decodable_text_fonts_type0_with_tounicode() {
+        // Type0/Identity-H font with ToUnicode: CID-encoded text but decodable.
+        // This is the bank-annual-report pattern.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let cmap_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"fake cmap".to_vec(),
+        )));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"BentonSans-Bold".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(page_has_decodable_text_fonts(&doc, page_id));
+    }
+
+    #[test]
+    fn test_page_has_decodable_text_fonts_undecodable_only_returns_false() {
+        // ONLY undecodable Identity-H (no ToUnicode, no fallback).
+        // Should return false — no path to recover this text.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+UnknownFont".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(!page_has_decodable_text_fonts(&doc, page_id));
+    }
+
+    // ---------- Test for the CID-aware looks_like_scan override ----------
+
+    #[test]
+    fn test_looks_like_scan_overridden_by_decodable_cid_text() {
+        // CID-encoded text page (Type0 with ToUnicode) has:
+        //   image_count = 1 (template image)
+        //   text_operator_count = 36 (real Tj/TJ ops emitting CID values)
+        //   unique_alphanum_chars = 8 (raw bytes are CIDs, not ASCII)
+        //   has_decodable_text_fonts = true
+        // Old check: looks_like_scan = (image<=1 && text<50 && alphanum<10) → TRUE (incorrect).
+        // New check: alphanum < 10 is overridden when decodable fonts present + text_ops >= 10
+        //           → looks_like_scan = false (correct — text IS decodable).
+        let image_count = 1u32;
+        let text_operator_count = 36u32;
+        let unique_alphanum_chars = 8u32;
+        let has_decodable_text_fonts = true;
+
+        let alphanum_low =
+            unique_alphanum_chars < 10 && !(has_decodable_text_fonts && text_operator_count >= 10);
+        let looks_like_scan = image_count <= 1 && text_operator_count < 50 && alphanum_low;
+        assert!(
+            !looks_like_scan,
+            "CID-encoded decodable text page should not be flagged as scan"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_scan_keeps_flag_when_no_decodable_fonts() {
+        // Same metrics as above but no decodable fonts → genuinely could be a scan.
+        // Override should NOT kick in — looks_like_scan remains true.
+        let image_count = 1u32;
+        let text_operator_count = 36u32;
+        let unique_alphanum_chars = 8u32;
+        let has_decodable_text_fonts = false;
+
+        let alphanum_low =
+            unique_alphanum_chars < 10 && !(has_decodable_text_fonts && text_operator_count >= 10);
+        let looks_like_scan = image_count <= 1 && text_operator_count < 50 && alphanum_low;
+        assert!(
+            looks_like_scan,
+            "page with no decodable fonts should remain flagged as scan"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_scan_keeps_flag_with_few_text_ops_even_if_decodable() {
+        // Truly scanned page with a small overlay (1-5 text_ops, e.g. page number).
+        // Has a decodable font (the page number font) but text_ops too low to
+        // override. MUST still flag as scan.
+        let image_count = 1u32;
+        let text_operator_count = 4u32;
+        let unique_alphanum_chars = 2u32;
+        let has_decodable_text_fonts = true;
+
+        let alphanum_low =
+            unique_alphanum_chars < 10 && !(has_decodable_text_fonts && text_operator_count >= 10);
+        let looks_like_scan = image_count <= 1 && text_operator_count < 50 && alphanum_low;
+        assert!(
+            looks_like_scan,
+            "scanned page with small text overlay (page number) should still flag"
+        );
+    }
 }
