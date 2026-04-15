@@ -1144,6 +1144,33 @@ pub(crate) fn find_first_table_row(
             continue;
         }
 
+        // Skip rows that have duplicate non-empty cells. These are spanning
+        // super-headers (e.g., "First Degree | First Degree | Higher Degree")
+        // that sit above the real column header row. Using them as the markdown
+        // header produces duplicate column names that downstream validation
+        // rejects. Only skip if a subsequent row looks like a better header
+        // (denser fill or has data).
+        if filled_count >= 2 && !has_data {
+            let mut text_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for cell in &filled_cells {
+                *text_counts.entry(cell.trim()).or_insert(0) += 1;
+            }
+            let has_duplicates = text_counts.values().any(|&count| count >= 2);
+            if has_duplicates {
+                // Check if a later row is a better header candidate
+                let has_better_below = cells.iter().skip(row_idx + 1).take(3).any(|r| {
+                    let next_filled = r.iter().filter(|c| !c.trim().is_empty()).count();
+                    let next_fill = next_filled as f32 / total_cols as f32;
+                    let next_numeric = r.iter().filter(|c| looks_like_number(c.trim())).count();
+                    next_fill >= 0.4 || next_numeric >= 2
+                });
+                if has_better_below {
+                    continue;
+                }
+            }
+        }
+
         // Data rows are definitely table content
         if has_data {
             first_table_row = row_idx;

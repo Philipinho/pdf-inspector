@@ -1438,6 +1438,42 @@ fn test_extract_tables_in_regions_nonexistent_page() {
     assert!(region.text.is_empty());
 }
 
+#[test]
+fn test_bits_pilani_page4_table_detection() {
+    // Page 4 (0-indexed 3) has a table with multi-line wrapped headers and
+    // numeric data columns. The heuristic detector previously failed because:
+    // 1. Header items at different X positions than data created extra column
+    //    clusters (6 cols instead of 4)
+    // 2. Spanning super-header row ("First Degree | First Degree") produced
+    //    duplicate header cells that looks_like_partial_table_ex rejected
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(3, vec![[0.0, 0.0, 612.0, 792.0]])]).unwrap();
+    assert_eq!(results.len(), 1);
+    let region = &results[0].regions[0];
+    assert!(
+        !region.needs_ocr,
+        "Page 4 table should be detected, got needs_ocr=true"
+    );
+    assert!(
+        region.text.contains("BIO"),
+        "Should contain department name BIO"
+    );
+    assert!(region.text.contains("8.23"), "Should contain numeric data");
+}
+
+#[test]
+fn test_bits_pilani_page8_table_detection() {
+    // Page 8 (0-indexed 7) has a numbered-row table that already worked.
+    // Verify it still works after changes.
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(7, vec![[0.0, 0.0, 612.0, 792.0]])]).unwrap();
+    assert_eq!(results.len(), 1);
+    let region = &results[0].regions[0];
+    assert!(!region.needs_ocr, "Page 8 table should still be detected");
+}
+
 // =========================================================================
 // extract_pages_markdown_mem tests
 // =========================================================================

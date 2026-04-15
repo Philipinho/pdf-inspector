@@ -82,32 +82,41 @@ pub(crate) fn find_column_boundaries(
         }
     }
 
-    let mut columns = Vec::new();
-    let mut cluster_items: Vec<f32> = vec![x_positions[0]];
+    // Track cluster membership: for each cluster, store the list of x positions
+    let mut cluster_xs: Vec<Vec<f32>> = vec![vec![x_positions[0]]];
 
     for &x in &x_positions[1..] {
+        let last_cluster = cluster_xs.last().unwrap();
         // For dense columns (gap-histogram triggered), use edge-based clustering:
         // compare with the last item to avoid center-drift that merges adjacent
         // narrow columns.  For normal tables, use center-based (original behavior).
         let reference = if use_edge_clustering {
-            *cluster_items.last().unwrap()
+            *last_cluster.last().unwrap()
         } else {
-            cluster_items.iter().sum::<f32>() / cluster_items.len() as f32
+            last_cluster.iter().sum::<f32>() / last_cluster.len() as f32
         };
 
         if x - reference > cluster_threshold {
-            let cluster_center = cluster_items.iter().sum::<f32>() / cluster_items.len() as f32;
-            columns.push(cluster_center);
-            cluster_items = vec![x];
+            cluster_xs.push(vec![x]);
         } else {
-            cluster_items.push(x);
+            cluster_xs.last_mut().unwrap().push(x);
         }
     }
 
-    // Don't forget last cluster
-    if !cluster_items.is_empty() {
-        columns.push(cluster_items.iter().sum::<f32>() / cluster_items.len() as f32);
+    // Numeric column merge pass: when a sparse cluster (few items, typically
+    // header text) is adjacent to a dense numeric cluster and within 1.5×
+    // threshold, merge them. This fixes tables where multi-line wrapped
+    // headers have slightly different X positions than the data columns,
+    // causing the header and data to split into separate clusters.
+    let columns_before_merge = cluster_xs.len();
+    if columns_before_merge >= 3 {
+        cluster_xs = merge_numeric_adjacent_clusters(cluster_xs, items, cluster_threshold);
     }
+
+    let columns: Vec<f32> = cluster_xs
+        .iter()
+        .map(|xs| xs.iter().sum::<f32>() / xs.len() as f32)
+        .collect();
 
     // Filter columns - each should have multiple items
     let min_items_per_col = (items.len() / columns.len().max(1) / 4).max(2);
@@ -123,8 +132,9 @@ pub(crate) fn find_column_boundaries(
         .collect();
 
     log::debug!(
-        "  find_column_boundaries: {} columns before filter, threshold={:.1}, {} items",
+        "  find_column_boundaries: {} columns (merged from {}), threshold={:.1}, {} items",
         columns.len(),
+        columns_before_merge,
         cluster_threshold,
         items.len()
     );
@@ -146,6 +156,116 @@ pub(crate) fn find_column_boundaries(
     }
 
     columns
+}
+
+/// Check if a text string looks like a number (digits, decimals, sign, comma).
+fn is_numeric_text(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // Match patterns like: 8.23, -1.05, 9.99, 7.12, 100, 3,456.78, +5%, ---
+    // But NOT: BIO, Department, Core Courses
+    s.chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == '+' || c == '%')
+        && s.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Merge adjacent X-position clusters when one is a sparse header cluster
+/// and the other is a dense numeric data cluster. This prevents multi-line
+/// wrapped headers from splitting a logical column into two clusters.
+fn merge_numeric_adjacent_clusters(
+    mut clusters: Vec<Vec<f32>>,
+    items: &[(usize, &TextItem)],
+    threshold: f32,
+) -> Vec<Vec<f32>> {
+    // For each cluster, compute: center, item count, numeric fraction
+    struct ClusterInfo {
+        center: f32,
+        count: usize,
+        numeric_frac: f32,
+    }
+
+    let compute_info = |xs: &[f32]| -> ClusterInfo {
+        let center = xs.iter().sum::<f32>() / xs.len() as f32;
+        // Count items and numeric fraction for items near this cluster center
+        let mut total = 0;
+        let mut numeric = 0;
+        for (_, item) in items {
+            if (item.x - center).abs() < threshold {
+                total += 1;
+                if is_numeric_text(&item.text) {
+                    numeric += 1;
+                }
+            }
+        }
+        ClusterInfo {
+            center,
+            count: total,
+            numeric_frac: if total > 0 {
+                numeric as f32 / total as f32
+            } else {
+                0.0
+            },
+        }
+    };
+
+    // Merge distance: allow merging clusters that are slightly beyond the
+    // original threshold. Use 1.5× threshold to catch header-vs-data splits.
+    let merge_dist = threshold * 1.5;
+
+    // Iterate and merge adjacent pairs. Use a simple left-to-right scan.
+    let mut merged = true;
+    while merged {
+        merged = false;
+        let mut i = 0;
+        while i + 1 < clusters.len() {
+            let info_a = compute_info(&clusters[i]);
+            let info_b = compute_info(&clusters[i + 1]);
+            let dist = (info_b.center - info_a.center).abs();
+
+            if dist > merge_dist {
+                i += 1;
+                continue;
+            }
+
+            // Determine if one cluster is sparse (header) and the other
+            // is dense and numeric (data). A cluster is "sparse" if it has
+            // significantly fewer items than the other.
+            let (sparse, dense) = if info_a.count < info_b.count {
+                (&info_a, &info_b)
+            } else {
+                (&info_b, &info_a)
+            };
+
+            // Merge if the dense cluster is predominantly numeric (>50%)
+            // and the sparse cluster has at most 1/3 the items of the dense one.
+            let should_merge =
+                dense.numeric_frac > 0.50 && sparse.count <= dense.count / 2 && sparse.count <= 5;
+
+            if should_merge {
+                log::debug!(
+                    "  merging column clusters: center {:.1} ({} items, {:.0}% numeric) + {:.1} ({} items, {:.0}% numeric), dist={:.1}",
+                    info_a.center,
+                    info_a.count,
+                    info_a.numeric_frac * 100.0,
+                    info_b.center,
+                    info_b.count,
+                    info_b.numeric_frac * 100.0,
+                    dist,
+                );
+                // Merge cluster i+1 into cluster i
+                let next = clusters.remove(i + 1);
+                clusters[i].extend(next);
+                merged = true;
+                // Don't increment i — check if the merged cluster can merge further
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    clusters
 }
 
 /// Find row boundaries by clustering Y positions
