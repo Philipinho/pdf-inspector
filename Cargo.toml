@@ -37,6 +37,10 @@ unicode-normalization = "0.1"
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"
 
+# JSON parsing for probe binaries
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [dev-dependencies]
 tempfile = "3.3"
 
@@ -55,3 +59,11 @@ path = "src/bin/detect_pdf.rs"
 [[bin]]
 name = "dump_ops"
 path = "src/bin/dump_ops.rs"
+
+[[bin]]
+name = "probe-formulas"
+path = "src/bin/probe_formulas.rs"
+
+[[bin]]
+name = "probe-formulas-latex"
+path = "src/bin/probe_formulas_latex.rs"
