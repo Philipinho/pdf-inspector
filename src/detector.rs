@@ -515,11 +515,17 @@ struct FontInfo {
 }
 
 /// Collect font entries from a Resources/Font dictionary into the font map.
-/// Each entry maps font_name (e.g. b"F1") → FontInfo.
+/// Each entry maps font ObjectId → FontInfo. Using ObjectId as the key
+/// avoids name collisions: different resource dictionaries can legally define
+/// `/F1` pointing to different font objects, and ObjectId uniquely identifies
+/// the underlying font regardless of the name used to reference it.
+///
+/// Inline font dictionaries (rare — fonts are almost always indirect refs)
+/// are skipped because they have no ObjectId.
 fn collect_fonts_from_resource_dict(
     doc: &Document,
     resources: &lopdf::Dictionary,
-    font_map: &mut HashMap<Vec<u8>, FontInfo>,
+    font_map: &mut HashMap<ObjectId, FontInfo>,
 ) {
     let font_obj = match resources.get(b"Font").ok() {
         Some(obj) => obj,
@@ -533,17 +539,17 @@ fn collect_fonts_from_resource_dict(
     let Some(font_dict) = font_dict else {
         return;
     };
-    for (name, value) in font_dict.iter() {
-        // Don't overwrite: page-level fonts take precedence over inherited ones,
-        // and we process page-level first.
-        if font_map.contains_key(name) {
+    for (_name, value) in font_dict.iter() {
+        // Only indirect references have a stable ObjectId.
+        // Inline font dicts are extremely rare and have no ObjectId — skip them.
+        let font_obj_id = match value {
+            Object::Reference(r) => *r,
+            _ => continue,
+        };
+        if font_map.contains_key(&font_obj_id) {
             continue;
         }
-        let resolved = match value {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
-            _ => None,
-        };
+        let resolved = doc.get_dictionary(font_obj_id).ok();
         if let Some(fd) = resolved {
             let subtype = fd
                 .get(b"Subtype")
@@ -557,7 +563,7 @@ fn collect_fonts_from_resource_dict(
                 .map(|n| n.to_vec());
             let has_tounicode = fd.get(b"ToUnicode").is_ok();
             font_map.insert(
-                name.clone(),
+                font_obj_id,
                 FontInfo {
                     subtype,
                     encoding,
@@ -565,6 +571,35 @@ fn collect_fonts_from_resource_dict(
                     dict: fd.clone(),
                 },
             );
+        }
+    }
+}
+
+/// Resolve font names (collected from a content stream) to ObjectIds using the
+/// given resource dictionary. This is how we scope font name resolution correctly:
+/// each content stream (page-level or Form XObject) resolves `/FontName` against
+/// its own Resources/Font dictionary, yielding the correct underlying font object.
+fn resolve_font_names_to_ids(
+    doc: &Document,
+    resources: &lopdf::Dictionary,
+    font_names: &HashSet<Vec<u8>>,
+    used_font_ids: &mut HashSet<ObjectId>,
+) {
+    let font_obj = match resources.get(b"Font").ok() {
+        Some(obj) => obj,
+        None => return,
+    };
+    let font_dict = match font_obj {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(r) => doc.get_dictionary(*r).ok(),
+        _ => None,
+    };
+    let Some(font_dict) = font_dict else {
+        return;
+    };
+    for name in font_names {
+        if let Ok(Object::Reference(r)) = font_dict.get(name) {
+            used_font_ids.insert(*r);
         }
     }
 }
@@ -577,40 +612,65 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
-    let mut used_font_names: HashSet<Vec<u8>> = HashSet::new();
+    // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
+    // Each content stream resolves its Tf font names against its own resource
+    // dictionary, producing the correct underlying font ObjectId.
+    let mut used_font_ids: HashSet<ObjectId> = HashSet::new();
 
-    // Get content streams for this page
+    // Build font map keyed by ObjectId: collects FontInfo for all fonts from
+    // page-level Resources + Form XObject Resources.
+    let mut font_map: HashMap<ObjectId, FontInfo> = HashMap::new();
+
+    // Get content streams for this page — these use the page's resource dict
     let content_streams = doc.get_page_contents(page_id);
+
+    // We need the page's resource dict to resolve font names from page content.
+    // get_page_resources returns (Option<&Dictionary>, Vec<ObjectId>) for
+    // inline and indirect resource dicts respectively.
+    let page_resources = doc.get_page_resources(page_id).ok();
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            // Try to decompress and scan content
             let content = match stream.decompressed_content() {
                 Ok(data) => data,
                 Err(_) => stream.content.clone(),
             };
 
-            // Scan for text operators (Tj, TJ), font changes (Tf), image operators (Do), and path ops
+            // Scan for text operators, collecting raw font names
+            let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
             let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
                 &content,
                 &mut all_unique_chars,
-                &mut used_font_names,
+                &mut page_font_names,
             );
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
             font_changes += fonts;
             has_images = has_images || imgs > 0;
+
+            // Resolve font names against the page's resource dictionaries
+            if let Some((ref resource_dict, ref resource_ids)) = page_resources {
+                if let Some(resources) = resource_dict {
+                    resolve_font_names_to_ids(doc, resources, &page_font_names, &mut used_font_ids);
+                }
+                for resource_id in resource_ids {
+                    if let Ok(resources) = doc.get_dictionary(*resource_id) {
+                        resolve_font_names_to_ids(
+                            doc,
+                            resources,
+                            &page_font_names,
+                            &mut used_font_ids,
+                        );
+                    }
+                }
+            }
         }
     }
 
-    // Build font map: font_name → font_dict, from page-level Resources + Form XObject Resources.
-    // This collects all fonts that could potentially be referenced by Tf operators, including
-    // fonts defined in Form XObject Resources (which get_page_fonts does NOT traverse).
-    let mut font_map: HashMap<Vec<u8>, FontInfo> = HashMap::new();
-
-    // Scan XObject Form contents for text operators, and collect their fonts
-    if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
+    // Scan XObject Form contents for text operators, collect their fonts,
+    // and resolve font names per-XObject scope.
+    if let Some((resource_dict, resource_ids)) = page_resources {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
@@ -619,7 +679,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 resources,
                 &mut visited,
                 &mut all_unique_chars,
-                &mut used_font_names,
+                &mut used_font_ids,
                 &mut font_map,
             );
             text_ops += ops;
@@ -636,7 +696,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     resources,
                     &mut visited,
                     &mut all_unique_chars,
-                    &mut used_font_names,
+                    &mut used_font_ids,
                     &mut font_map,
                 );
                 text_ops += ops;
@@ -675,19 +735,18 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
     // and include fonts from Form XObject Resources (P2 fix).
     let has_identity_h_no_tounicode =
-        text_ops > 0 && used_fonts_have_identity_h_no_tounicode(&used_font_names, &font_map, doc);
+        text_ops > 0 && used_fonts_have_identity_h_no_tounicode(&used_font_ids, &font_map, doc);
 
     // Check for Type3-only fonts — glyph bitmaps without Unicode mapping.
     // Uses the usage-based font set for accuracy.
-    let has_only_type3_fonts =
-        text_ops > 0 && used_fonts_are_only_type3(&used_font_names, &font_map);
+    let has_only_type3_fonts = text_ops > 0 && used_fonts_are_only_type3(&used_font_ids, &font_map);
 
     // Check if the page has fonts that can decode text to Unicode.
     // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
     // bytes but are fully decodable — we need this to avoid false scan detection.
     // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
     let has_decodable_text_fonts =
-        text_ops > 0 && used_fonts_have_decodable_text(&used_font_names, &font_map, doc);
+        text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
 
     PageAnalysis {
         text_operator_count: text_ops,
@@ -973,15 +1032,15 @@ fn page_has_decodable_text_fonts(doc: &Document, page_id: ObjectId) -> bool {
 /// referenced by Tf operators in content streams (P1 fix) and includes fonts from
 /// Form XObject Resources (P2 fix).
 fn used_fonts_have_identity_h_no_tounicode(
-    used_font_names: &HashSet<Vec<u8>>,
-    font_map: &HashMap<Vec<u8>, FontInfo>,
+    used_font_ids: &HashSet<ObjectId>,
+    font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
 ) -> bool {
     let mut has_undecodable_identity_h = false;
     let mut has_other_decodable_font = false;
 
-    for name in used_font_names {
-        let Some(info) = font_map.get(name) else {
+    for id in used_font_ids {
+        let Some(info) = font_map.get(id) else {
             continue;
         };
         match info.subtype.as_deref() {
@@ -1022,15 +1081,15 @@ fn used_fonts_have_identity_h_no_tounicode(
 /// Unlike `page_has_only_type3_fonts`, this only considers fonts actually referenced
 /// by Tf operators (P1 fix) and includes Form XObject fonts (P2 fix).
 fn used_fonts_are_only_type3(
-    used_font_names: &HashSet<Vec<u8>>,
-    font_map: &HashMap<Vec<u8>, FontInfo>,
+    used_font_ids: &HashSet<ObjectId>,
+    font_map: &HashMap<ObjectId, FontInfo>,
 ) -> bool {
-    if used_font_names.is_empty() {
+    if used_font_ids.is_empty() {
         return false;
     }
     let mut has_type3 = false;
-    for name in used_font_names {
-        let Some(info) = font_map.get(name) else {
+    for id in used_font_ids {
+        let Some(info) = font_map.get(id) else {
             continue;
         };
         if info.subtype.as_deref() == Some(b"Type3") {
@@ -1051,12 +1110,12 @@ fn used_fonts_are_only_type3(
 /// Unlike `page_has_decodable_text_fonts`, this only considers fonts actually
 /// referenced by Tf operators (P1 fix) and includes Form XObject fonts (P2 fix).
 fn used_fonts_have_decodable_text(
-    used_font_names: &HashSet<Vec<u8>>,
-    font_map: &HashMap<Vec<u8>, FontInfo>,
+    used_font_ids: &HashSet<ObjectId>,
+    font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
 ) -> bool {
-    for name in used_font_names {
-        let Some(info) = font_map.get(name) else {
+    for id in used_font_ids {
+        let Some(info) = font_map.get(id) else {
             continue;
         };
         if info.has_tounicode {
@@ -1082,8 +1141,8 @@ fn scan_xobjects_in_resources(
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
-    used_font_names: &mut HashSet<Vec<u8>>,
-    font_map: &mut HashMap<Vec<u8>, FontInfo>,
+    used_font_ids: &mut HashSet<ObjectId>,
+    font_map: &mut HashMap<ObjectId, FontInfo>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
@@ -1117,26 +1176,44 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    let (ops, imgs, paths, fonts) =
-                        scan_content_for_text_operators(&content, unique_chars, used_font_names);
+                    // Collect raw font names from this XObject's content stream
+                    let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
+                    let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+                        &content,
+                        unique_chars,
+                        &mut xobj_font_names,
+                    );
                     text_ops += ops;
                     image_count += imgs;
                     path_ops += paths;
                     font_changes += fonts;
-                    if let Some(res) = stream
-                        .dict
-                        .get(b"Resources")
-                        .ok()
-                        .and_then(|o| o.as_dict().ok())
-                    {
-                        // Collect fonts from the Form XObject's own Resources (P2 fix)
+
+                    // Resolve the Form XObject's /Resources — handle both inline
+                    // dicts and indirect references (P2 fix: indirect refs were
+                    // previously skipped by as_dict()).
+                    let xobj_res_owned;
+                    let xobj_res = match stream.dict.get(b"Resources").ok() {
+                        Some(Object::Dictionary(d)) => Some(d),
+                        Some(Object::Reference(r)) => {
+                            xobj_res_owned = doc.get_dictionary(*r).ok();
+                            xobj_res_owned
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(res) = xobj_res {
+                        // Resolve font names against the XObject's own resource dict
+                        // (P1 fix: scoped resolution, not global name-based lookup)
+                        resolve_font_names_to_ids(doc, res, &xobj_font_names, used_font_ids);
+                        // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
+                        // Recurse into nested XObjects
                         let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
                             doc,
                             res,
                             visited,
                             unique_chars,
-                            used_font_names,
+                            used_font_ids,
                             font_map,
                         );
                         text_ops += ops2;
@@ -2833,6 +2910,356 @@ mod tests {
         assert!(
             !analysis.has_identity_h_no_tounicode,
             "P2: no Identity-H font used, should not flag"
+        );
+    }
+
+    // ---------- P1 regression: font name collisions across resource scopes ----------
+
+    #[test]
+    fn test_p1_name_collision_xobject_decodable_page_undecodable() {
+        // P1 bug scenario: Page Resources has /F1 -> undecodable Identity-H.
+        // Form XObject Resources has /F1 -> decodable Type1. DIFFERENT font, same name.
+        // Only the XObject's content uses /F1.
+        //
+        // Without fix: global name-keyed font_map has page's undecodable /F1;
+        //   XObject's /F1 is skipped (contains_key). Lookup resolves to the WRONG font
+        //   -> page wrongly flagged.
+        // With fix (ObjectId-based): XObject's Tf resolves /F1 against XObject's own
+        //   Resources, yielding the decodable Type1's ObjectId -> correctly NOT flagged.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Page-level /F1: undecodable Identity-H (no ToUnicode, no fallback)
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+BadFont".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+
+        // XObject-level /F1: decodable Type1 — DIFFERENT underlying font, same /F1 name
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        // Form XObject: its own Resources define /F1 -> good_font_id
+        let xobj_content = b"BT /F1 10 Tf (Hello from XObject) Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(good_font_id),
+                    },
+                },
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        // Page content: only invokes the XObject, no direct text
+        let content_data = b"/XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+            },
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "P1 name collision: XObject uses /F1 which resolves to decodable Type1 \
+             in XObject scope — should NOT flag even though page's /F1 is undecodable"
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P1 name collision: XObject's /F1 is decodable Type1"
+        );
+    }
+
+    #[test]
+    fn test_p1_name_collision_xobject_undecodable_page_decodable() {
+        // Inverse P1 scenario: Page Resources has /F1 -> decodable Type1.
+        // Form XObject Resources has /F1 -> undecodable Identity-H.
+        // Only the XObject's content uses /F1.
+        //
+        // Without fix: global font_map has page's decodable /F1; XObject's /F1
+        //   skipped. Lookup resolves to page's decodable font -> wrongly unflagged.
+        // With fix: XObject's Tf resolves /F1 against XObject Resources, gets the
+        //   undecodable Identity-H ObjectId -> correctly flagged.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Page-level /F1: decodable Type1
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        // XObject-level /F1: undecodable Identity-H — DIFFERENT font, same name
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"XYZDEF+BadCIDFont".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+
+        // Form XObject: its own Resources define /F1 -> bad_font_id
+        let xobj_content = b"BT /F1 10 Tf <0102030405> Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(bad_font_id),
+                    },
+                },
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        // Page content: only invokes the XObject
+        let content_data = b"/XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(good_font_id),
+            },
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_identity_h_no_tounicode,
+            "P1 inverse: XObject uses /F1 which resolves to undecodable Identity-H \
+             in XObject scope — MUST flag even though page's /F1 is decodable Type1"
+        );
+    }
+
+    // ---------- P2 regression: indirect Form XObject Resources ----------
+
+    #[test]
+    fn test_p2_indirect_xobject_resources() {
+        // P2 bug: Form XObject's /Resources stored as an indirect reference (X 0 R)
+        // instead of an inline dictionary. The old code used as_dict() which returns
+        // None for indirect refs, causing the entire Resources branch to be skipped.
+        //
+        // With fix: we also handle Object::Reference by resolving it.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Font inside the XObject — decodable Type1
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        // Store the XObject's Resources as a separate indirect object
+        let xobj_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        }));
+
+        // Form XObject: /Resources is an indirect reference (the bug trigger)
+        let xobj_content = b"BT /F1 10 Tf (Hello) Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => Object::Reference(xobj_resources_id),
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        let content_data = b"/XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P2 indirect: decodable font behind indirect /Resources must be discovered"
+        );
+        assert_eq!(
+            analysis.text_operator_count, 1,
+            "P2 indirect: text ops from XObject content should be counted"
+        );
+    }
+
+    // ---------- P1 + P2 combined: indirect Resources with name collisions ----------
+
+    #[test]
+    fn test_p1_p2_combined_indirect_resources_with_name_collision() {
+        // Combined scenario: Page has /F1 -> undecodable Identity-H.
+        // Form XObject has /F1 -> decodable Type1 stored via INDIRECT /Resources.
+        // XObject content uses /F1 which should resolve to the decodable one.
+        //
+        // This tests both bugs simultaneously:
+        // P1: name collision (/F1 means different fonts in different scopes)
+        // P2: XObject Resources is an indirect reference
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // Page-level /F1: undecodable
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+BadFont".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+
+        // XObject-level /F1: decodable Type1 — different underlying font
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"TimesNewRoman".to_vec()),
+        });
+
+        // XObject Resources as an indirect reference (P2)
+        let xobj_resources_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(good_font_id),
+            },
+        }));
+
+        let xobj_content = b"BT /F1 12 Tf (Decodable text in XObject) Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => Object::Reference(xobj_resources_id),
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        let content_data = b"/XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+            },
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "P1+P2 combined: XObject /F1 resolves to decodable Type1 via indirect \
+             Resources — should NOT flag despite page /F1 being undecodable"
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P1+P2 combined: should detect decodable font from indirect XObject Resources"
         );
     }
 }
