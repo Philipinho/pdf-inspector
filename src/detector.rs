@@ -396,16 +396,16 @@ pub(crate) fn detect_from_document(
             pages_needing_ocr.push(page_num);
         }
     }
-    // Check uncached pages too (when not all pages were sampled)
+    // Check uncached pages too (when not all pages were sampled).
+    // Use analyze_page_content to get usage-based font checks (P1 + P2 fix).
     if pages_needing_ocr.len() < total_pages as usize {
         for page_num in 1..=total_pages {
             if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                if page_has_identity_h_no_tounicode(doc, page_id)
-                    || page_has_only_type3_fonts(doc, page_id)
-                {
+                let analysis = analyze_page_content(doc, page_id);
+                if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                 }
             }
@@ -501,6 +501,74 @@ struct PageAnalysis {
     has_decodable_text_fonts: bool,
 }
 
+/// Extracted font information from a Resource dictionary entry.
+/// Stores the properties needed for decodability/identity-h checks
+/// without holding a reference to the document.
+#[derive(Clone, Debug)]
+struct FontInfo {
+    subtype: Option<Vec<u8>>,
+    encoding: Option<Vec<u8>>,
+    has_tounicode: bool,
+    /// The raw font dictionary as an owned lopdf Dictionary.
+    /// Needed for fallback checks (DescendantFonts → W array, embedded cmap).
+    dict: lopdf::Dictionary,
+}
+
+/// Collect font entries from a Resources/Font dictionary into the font map.
+/// Each entry maps font_name (e.g. b"F1") → FontInfo.
+fn collect_fonts_from_resource_dict(
+    doc: &Document,
+    resources: &lopdf::Dictionary,
+    font_map: &mut HashMap<Vec<u8>, FontInfo>,
+) {
+    let font_obj = match resources.get(b"Font").ok() {
+        Some(obj) => obj,
+        None => return,
+    };
+    let font_dict = match font_obj {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(r) => doc.get_dictionary(*r).ok(),
+        _ => None,
+    };
+    let Some(font_dict) = font_dict else {
+        return;
+    };
+    for (name, value) in font_dict.iter() {
+        // Don't overwrite: page-level fonts take precedence over inherited ones,
+        // and we process page-level first.
+        if font_map.contains_key(name) {
+            continue;
+        }
+        let resolved = match value {
+            Object::Reference(r) => doc.get_dictionary(*r).ok(),
+            Object::Dictionary(d) => Some(d),
+            _ => None,
+        };
+        if let Some(fd) = resolved {
+            let subtype = fd
+                .get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| n.to_vec());
+            let encoding = fd
+                .get(b"Encoding")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| n.to_vec());
+            let has_tounicode = fd.get(b"ToUnicode").is_ok();
+            font_map.insert(
+                name.clone(),
+                FontInfo {
+                    subtype,
+                    encoding,
+                    has_tounicode,
+                    dict: fd.clone(),
+                },
+            );
+        }
+    }
+}
+
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut text_ops = 0u32;
@@ -509,6 +577,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
+    let mut used_font_names: HashSet<Vec<u8>> = HashSet::new();
 
     // Get content streams for this page
     let content_streams = doc.get_page_contents(page_id);
@@ -522,8 +591,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
             };
 
             // Scan for text operators (Tj, TJ), font changes (Tf), image operators (Do), and path ops
-            let (ops, imgs, paths, fonts) =
-                scan_content_for_text_operators(&content, &mut all_unique_chars);
+            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+                &content,
+                &mut all_unique_chars,
+                &mut used_font_names,
+            );
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
@@ -532,12 +604,24 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         }
     }
 
-    // Scan XObject Form contents for text operators
+    // Build font map: font_name → font_dict, from page-level Resources + Form XObject Resources.
+    // This collects all fonts that could potentially be referenced by Tf operators, including
+    // fonts defined in Form XObject Resources (which get_page_fonts does NOT traverse).
+    let mut font_map: HashMap<Vec<u8>, FontInfo> = HashMap::new();
+
+    // Scan XObject Form contents for text operators, and collect their fonts
     if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
-            let (ops, imgs, paths, fonts) =
-                scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
+            collect_fonts_from_resource_dict(doc, resources, &mut font_map);
+            let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+                doc,
+                resources,
+                &mut visited,
+                &mut all_unique_chars,
+                &mut used_font_names,
+                &mut font_map,
+            );
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
@@ -546,8 +630,15 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                let (ops, imgs, paths, fonts) =
-                    scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
+                collect_fonts_from_resource_dict(doc, resources, &mut font_map);
+                let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+                    doc,
+                    resources,
+                    &mut visited,
+                    &mut all_unique_chars,
+                    &mut used_font_names,
+                    &mut font_map,
+                );
                 text_ops += ops;
                 image_count += imgs;
                 path_ops += paths;
@@ -580,17 +671,23 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let has_vector_text =
         path_ops >= 1000 && path_ops > text_ops.saturating_mul(200) && unique_alphanum_chars < 30;
 
-    // Check for Identity-H/V fonts without ToUnicode — these produce garbage text
+    // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
+    // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
+    // and include fonts from Form XObject Resources (P2 fix).
     let has_identity_h_no_tounicode =
-        text_ops > 0 && page_has_identity_h_no_tounicode(doc, page_id);
+        text_ops > 0 && used_fonts_have_identity_h_no_tounicode(&used_font_names, &font_map, doc);
 
-    // Check for Type3-only fonts — glyph bitmaps without Unicode mapping
-    let has_only_type3_fonts = text_ops > 0 && page_has_only_type3_fonts(doc, page_id);
+    // Check for Type3-only fonts — glyph bitmaps without Unicode mapping.
+    // Uses the usage-based font set for accuracy.
+    let has_only_type3_fonts =
+        text_ops > 0 && used_fonts_are_only_type3(&used_font_names, &font_map);
 
     // Check if the page has fonts that can decode text to Unicode.
     // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
     // bytes but are fully decodable — we need this to avoid false scan detection.
-    let has_decodable_text_fonts = text_ops > 0 && page_has_decodable_text_fonts(doc, page_id);
+    // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
+    let has_decodable_text_fonts =
+        text_ops > 0 && used_fonts_have_decodable_text(&used_font_names, &font_map, doc);
 
     PageAnalysis {
         text_operator_count: text_ops,
@@ -616,6 +713,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 /// Returns false when the page also has other decodable text fonts (Type1, TrueType,
 /// or Type0 with ToUnicode/fallback). In that case the undecodable Identity-H font
 /// is supplementary and the page has enough good text for extraction.
+///
+/// NOTE: This is a resource-based check (examines ALL fonts in Resources/Font, not just
+/// those used by Tf operators). Superseded by `used_fonts_have_identity_h_no_tounicode`
+/// in production code. Kept for unit tests that validate font-level classification.
+#[cfg(test)]
 fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -783,6 +885,10 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
 /// Returns true if every font on the page is Type3 (no normal text fonts).
 /// Type3 fonts render glyphs as custom drawings/bitmaps. Without a ToUnicode
 /// CMap, character codes can't be mapped to Unicode — the page needs OCR.
+///
+/// NOTE: Resource-based check. Superseded by `used_fonts_are_only_type3`.
+/// Kept for existing unit tests.
+#[cfg(test)]
 fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -824,6 +930,10 @@ fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
 /// This distinguishes pages with CID-encoded text that IS decodable (via ToUnicode)
 /// from scanned pages that happen to have a few decorative text ops. CID text produces
 /// low unique_alphanum_chars in raw bytes but can map to full Unicode through ToUnicode.
+///
+/// NOTE: Resource-based check. Superseded by `used_fonts_have_decodable_text`.
+/// Kept for existing unit tests.
+#[cfg(test)]
 fn page_has_decodable_text_fonts(doc: &Document, page_id: ObjectId) -> bool {
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -856,11 +966,124 @@ fn page_has_decodable_text_fonts(doc: &Document, page_id: ObjectId) -> bool {
     false
 }
 
+/// Usage-based check: do the USED fonts include an undecodable Identity-H/V font
+/// without any other decodable font to compensate?
+///
+/// Unlike `page_has_identity_h_no_tounicode`, this only considers fonts actually
+/// referenced by Tf operators in content streams (P1 fix) and includes fonts from
+/// Form XObject Resources (P2 fix).
+fn used_fonts_have_identity_h_no_tounicode(
+    used_font_names: &HashSet<Vec<u8>>,
+    font_map: &HashMap<Vec<u8>, FontInfo>,
+    doc: &Document,
+) -> bool {
+    let mut has_undecodable_identity_h = false;
+    let mut has_other_decodable_font = false;
+
+    for name in used_font_names {
+        let Some(info) = font_map.get(name) else {
+            continue;
+        };
+        match info.subtype.as_deref() {
+            Some(b"Type0") => {
+                let is_identity = matches!(
+                    info.encoding.as_deref(),
+                    Some(b"Identity-H") | Some(b"Identity-V")
+                );
+                if !is_identity {
+                    has_other_decodable_font = true;
+                    continue;
+                }
+                if info.has_tounicode {
+                    has_other_decodable_font = true;
+                    continue;
+                }
+                if identity_h_font_has_fallback(&info.dict, doc) {
+                    has_other_decodable_font = true;
+                    continue;
+                }
+                has_undecodable_identity_h = true;
+            }
+            Some(b"Type3") => {
+                // Handled separately by used_fonts_are_only_type3
+            }
+            _ => {
+                // Type1, TrueType, MMType1, etc. — generally decodable
+                has_other_decodable_font = true;
+            }
+        }
+    }
+
+    has_undecodable_identity_h && !has_other_decodable_font
+}
+
+/// Usage-based check: are ALL used fonts Type3 without ToUnicode?
+///
+/// Unlike `page_has_only_type3_fonts`, this only considers fonts actually referenced
+/// by Tf operators (P1 fix) and includes Form XObject fonts (P2 fix).
+fn used_fonts_are_only_type3(
+    used_font_names: &HashSet<Vec<u8>>,
+    font_map: &HashMap<Vec<u8>, FontInfo>,
+) -> bool {
+    if used_font_names.is_empty() {
+        return false;
+    }
+    let mut has_type3 = false;
+    for name in used_font_names {
+        let Some(info) = font_map.get(name) else {
+            continue;
+        };
+        if info.subtype.as_deref() == Some(b"Type3") {
+            if info.has_tounicode {
+                return false;
+            }
+            has_type3 = true;
+        } else {
+            return false;
+        }
+    }
+    has_type3
+}
+
+/// Usage-based check: do the USED fonts include at least one that can produce
+/// decodable Unicode text?
+///
+/// Unlike `page_has_decodable_text_fonts`, this only considers fonts actually
+/// referenced by Tf operators (P1 fix) and includes Form XObject fonts (P2 fix).
+fn used_fonts_have_decodable_text(
+    used_font_names: &HashSet<Vec<u8>>,
+    font_map: &HashMap<Vec<u8>, FontInfo>,
+    doc: &Document,
+) -> bool {
+    for name in used_font_names {
+        let Some(info) = font_map.get(name) else {
+            continue;
+        };
+        if info.has_tounicode {
+            return true;
+        }
+        match info.subtype.as_deref() {
+            Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => {
+                return true;
+            }
+            Some(b"Type0") => {
+                if identity_h_font_has_fallback(&info.dict, doc) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
+    font_map: &mut HashMap<Vec<u8>, FontInfo>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
@@ -895,7 +1118,7 @@ fn scan_xobjects_in_resources(
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
                     let (ops, imgs, paths, fonts) =
-                        scan_content_for_text_operators(&content, unique_chars);
+                        scan_content_for_text_operators(&content, unique_chars, used_font_names);
                     text_ops += ops;
                     image_count += imgs;
                     path_ops += paths;
@@ -906,8 +1129,16 @@ fn scan_xobjects_in_resources(
                         .ok()
                         .and_then(|o| o.as_dict().ok())
                     {
-                        let (ops2, imgs2, paths2, fonts2) =
-                            scan_xobjects_in_resources(doc, res, visited, unique_chars);
+                        // Collect fonts from the Form XObject's own Resources (P2 fix)
+                        collect_fonts_from_resource_dict(doc, res, font_map);
+                        let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
+                            doc,
+                            res,
+                            visited,
+                            unique_chars,
+                            used_font_names,
+                            font_map,
+                        );
                         text_ops += ops2;
                         image_count += imgs2;
                         path_ops += paths2;
@@ -938,6 +1169,7 @@ fn scan_xobjects_in_resources(
 fn scan_content_for_text_operators(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let image_count = 0u32;
@@ -984,6 +1216,12 @@ fn scan_content_for_text_operators(
                     || content[i + 2] == b'/'
                 {
                     font_changes += 1;
+                    // Extract the font name operand preceding the size + Tf.
+                    // Pattern: /FontName <size> Tf
+                    // Scan backward past the size number and whitespace to find /Name.
+                    if let Some(name) = extract_font_name_before_tf(content, i) {
+                        used_font_names.insert(name);
+                    }
                 }
             }
         }
@@ -1026,6 +1264,50 @@ fn scan_content_for_text_operators(
     }
 
     (text_ops, image_count, path_ops, font_changes)
+}
+
+/// Extract the font name operand from content stream bytes preceding a Tf operator.
+///
+/// The Tf operator syntax is: `/FontName size Tf`
+/// We scan backward from the position of 'T' in 'Tf' past the size number and
+/// whitespace to find the `/Name` token.
+///
+/// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
+fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>> {
+    // Scan backward past whitespace before "Tf"
+    let mut j = tf_pos;
+    while j > 0 && content[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    // Scan backward past the size number (digits, '.', '-')
+    while j > 0
+        && (content[j - 1].is_ascii_digit() || content[j - 1] == b'.' || content[j - 1] == b'-')
+    {
+        j -= 1;
+    }
+    // Scan backward past whitespace between font name and size
+    while j > 0 && content[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    // Now j should point just after the font name. Scan backward to find '/'.
+    let name_end = j;
+    while j > 0 && content[j - 1] != b'/' {
+        // Font names consist of regular characters (not whitespace, not delimiters)
+        if content[j - 1].is_ascii_whitespace() || content[j - 1] == b'(' || content[j - 1] == b')'
+        {
+            return None;
+        }
+        j -= 1;
+    }
+    if j == 0 || content[j - 1] != b'/' {
+        return None;
+    }
+    // j-1 is the '/', font name is content[j..name_end]
+    if j < name_end {
+        Some(content[j..name_end].to_vec())
+    } else {
+        None
+    }
 }
 
 /// Scan backward from a Tj/TJ operator to find the preceding string operand
@@ -1384,7 +1666,8 @@ mod tests {
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
-        let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
@@ -1393,7 +1676,8 @@ mod tests {
         // Content with TJ array
         uchars.clear();
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
-        let (ops2, _, _, _) = scan_content_for_text_operators(content2, &mut uchars);
+        let (ops2, _, _, _) =
+            scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
         assert!(uchars.len() >= 4);
@@ -1402,7 +1686,8 @@ mod tests {
         // actual image detection is handled by scan_xobjects_in_resources)
         uchars.clear();
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
-        let (ops3, imgs3, _, _) = scan_content_for_text_operators(content3, &mut uchars);
+        let (ops3, imgs3, _, _) =
+            scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 0);
     }
@@ -1421,7 +1706,8 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
         let mut uchars = HashSet::new();
-        let (ops, imgs, _, _) = scan_content_for_text_operators(&content, &mut uchars);
+        let (ops, imgs, _, _) =
+            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 3);
         assert_eq!(imgs, 0); // Do operators are not counted here
         assert_eq!(uchars.len(), 1);
@@ -1432,7 +1718,8 @@ mod tests {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
         let mut uchars = HashSet::new();
-        let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _, _) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0); // Do operators not counted here
                              // Many unique chars from the sentence
@@ -1452,7 +1739,8 @@ mod tests {
         content.extend_from_slice(b"f\n");
 
         let mut uchars = HashSet::new();
-        let (text, imgs, paths, _) = scan_content_for_text_operators(&content, &mut uchars);
+        let (text, imgs, paths, _) =
+            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(text, 1);
         assert_eq!(imgs, 0);
         // 500 * (m + l + c + h) + 1 f = 2001
@@ -1477,7 +1765,8 @@ mod tests {
         }
 
         let mut uchars = HashSet::new();
-        let (text, _, paths, _) = scan_content_for_text_operators(&content, &mut uchars);
+        let (text, _, paths, _) =
+            scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(text, 20);
         assert!(paths >= 40, "expected >= 40 path ops, got {paths}");
 
@@ -1721,7 +2010,8 @@ mod tests {
     fn test_scan_content_counts_tf_operators() {
         let mut uchars = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
-        let (ops, _, _, fonts) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, _, _, fonts) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 2);
         assert_eq!(fonts, 2);
     }
@@ -1734,28 +2024,32 @@ mod tests {
 
         // Tf followed by '[' (TJ array start)
         let content = b"BT /F1 25 Tf[<01>1<02>-1] TJ ET";
-        let (ops, _, _, fonts) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, _, _, fonts) =
+            scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(fonts, 1, "Tf followed by '[' should be counted");
         assert_eq!(ops, 1);
 
         // Tf followed by '(' (literal string)
         uchars.clear();
         let content2 = b"BT /F1 12 Tf(Hello) Tj ET";
-        let (ops2, _, _, fonts2) = scan_content_for_text_operators(content2, &mut uchars);
+        let (ops2, _, _, fonts2) =
+            scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
         assert_eq!(fonts2, 1, "Tf followed by '(' should be counted");
         assert_eq!(ops2, 1);
 
         // Tf followed by '<' (hex string)
         uchars.clear();
         let content3 = b"BT /F1 12 Tf<0102> Tj ET";
-        let (ops3, _, _, fonts3) = scan_content_for_text_operators(content3, &mut uchars);
+        let (ops3, _, _, fonts3) =
+            scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
         assert_eq!(fonts3, 1, "Tf followed by '<' should be counted");
         assert_eq!(ops3, 1);
 
         // Tf followed by '/' (next font name)
         uchars.clear();
         let content4 = b"BT /F1 12 Tf/F2 10 Tf (x) Tj ET";
-        let (_, _, _, fonts4) = scan_content_for_text_operators(content4, &mut uchars);
+        let (_, _, _, fonts4) =
+            scan_content_for_text_operators(content4, &mut uchars, &mut HashSet::new());
         assert_eq!(fonts4, 2, "Tf followed by '/' should be counted");
     }
 
@@ -2147,6 +2441,398 @@ mod tests {
         assert!(
             looks_like_scan,
             "scanned page with small text overlay (page number) should still flag"
+        );
+    }
+
+    // ---------- Tests for extract_font_name_before_tf ----------
+
+    #[test]
+    fn test_extract_font_name_basic() {
+        // Standard pattern: /F1 12 Tf
+        let content = b"/F1 12 Tf";
+        let name = extract_font_name_before_tf(content, 6); // 'T' is at index 6
+        assert_eq!(name, Some(b"F1".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_font_name_long_name() {
+        let content = b"/ArialMT-Bold 9.5 Tf";
+        let name = extract_font_name_before_tf(content, 18);
+        assert_eq!(name, Some(b"ArialMT-Bold".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_content_collects_used_font_names() {
+        let mut uchars = HashSet::new();
+        let mut fonts = HashSet::new();
+        let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
+        scan_content_for_text_operators(content, &mut uchars, &mut fonts);
+        assert!(fonts.contains(&b"F1".to_vec()), "should collect F1");
+        assert!(fonts.contains(&b"F2".to_vec()), "should collect F2");
+        assert_eq!(fonts.len(), 2);
+    }
+
+    // ---------- P1 tests: usage-based font filtering ----------
+
+    #[test]
+    fn test_p1_unused_decodable_font_does_not_save_undecodable_page() {
+        // P1 bug scenario: page Resources has TWO fonts:
+        // - /F1: undecodable Identity-H (used in content stream)
+        // - /F2: decodable Type1 (NOT used in content stream — leftover/inherited)
+        //
+        // Old resource-based check: sees F2 decodable → wrongly unflagged.
+        // New usage-based check: only F1 is used → correctly flagged.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // F1: undecodable Identity-H (no ToUnicode, no fallback)
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Cosmos-Medium".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        // F2: decodable Type1 (unused — leftover in Resources)
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        // Content stream only uses /F1
+        let content_data = b"BT /F1 12 Tf <0102030405> Tj ET";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+                "F2" => Object::Reference(good_font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_identity_h_no_tounicode,
+            "P1: page using only undecodable Identity-H should be flagged, even though \
+             Resources also contains unused decodable Type1"
+        );
+        // Verify the old resource-based check would have been WRONG (the bug we're fixing)
+        assert!(
+            !page_has_identity_h_no_tounicode(&doc, page_id),
+            "sanity: old resource-based check incorrectly sees unused decodable font"
+        );
+    }
+
+    #[test]
+    fn test_p1_used_decodable_font_still_unflagged() {
+        // Counterpart: both fonts ARE used in content → decodable font saves the page.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Cosmos-Medium".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        // Content stream uses BOTH /F1 and /F2
+        let content_data = b"BT /F1 12 Tf <0102> Tj /F2 10 Tf (Hello world) Tj ET";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+                "F2" => Object::Reference(good_font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "page using both undecodable and decodable fonts should NOT be flagged"
+        );
+    }
+
+    // ---------- P2 tests: Form XObject font traversal ----------
+
+    #[test]
+    fn test_p2_decodable_font_in_xobject_unflagged() {
+        // P2 scenario: page-level Resources has only undecodable Identity-H (/F1),
+        // but a Form XObject's Resources has a decodable Type1 font (/F2).
+        // Content stream uses /F1 at page level, and the XObject uses /F2.
+        // The page should NOT be flagged because text IS decodable (in XObject).
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // F1: undecodable Identity-H at page level
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Cosmos-Medium".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        // F2: decodable Type1 in XObject
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        // Form XObject: uses /F2 for decodable text
+        let xobj_content = b"BT /F2 10 Tf (Hello from XObject) Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F2" => Object::Reference(good_font_id),
+                    },
+                },
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        // Page content: uses /F1 and invokes the XObject
+        let content_data = b"BT /F1 12 Tf <0102> Tj ET /XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(bad_font_id),
+            },
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "P2: page with decodable font in Form XObject should NOT be flagged — \
+             the XObject has decodable text"
+        );
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P2: should detect decodable fonts from Form XObject Resources"
+        );
+    }
+
+    #[test]
+    fn test_p2_undecodable_font_only_in_xobject_flagged() {
+        // P2 negative test: page-level Resources has decodable Type1 (/F1),
+        // but only the Form XObject uses text (with undecodable Identity-H /F2).
+        // Content stream uses ONLY /F2 (via XObject). Should flag.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // F1: decodable Type1 at page level (NOT used by content)
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        // F2: undecodable Identity-H in XObject
+        let bad_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+Cosmos-Medium".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+
+        // Form XObject: uses /F2 (undecodable)
+        let xobj_content = b"BT /F2 10 Tf <0102030405> Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F2" => Object::Reference(bad_font_id),
+                    },
+                },
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        // Page content: only invokes XObject (no direct Tf at page level)
+        let content_data = b"/XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(good_font_id),
+            },
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_identity_h_no_tounicode,
+            "P2 negative: only used font is undecodable (in XObject) — must flag, \
+             even though page-level Resources has an unused decodable Type1"
+        );
+    }
+
+    #[test]
+    fn test_p2_decodable_fonts_detected_from_xobject() {
+        // P2: has_decodable_text_fonts should be true when the only decodable font
+        // is inside a Form XObject's Resources (not at page level).
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        // F1: decodable Type1, only in XObject
+        let good_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+
+        let xobj_content = b"BT /F1 10 Tf (Hello) Tj ET";
+        let xobj_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => Object::Reference(good_font_id),
+                    },
+                },
+            },
+            xobj_content.to_vec(),
+        );
+        let xobj_id = doc.add_object(Object::Stream(xobj_stream));
+
+        let content_data = b"/XF1 Do";
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            content_data.to_vec(),
+        )));
+        let resources = dictionary! {
+            "XObject" => dictionary! {
+                "XF1" => Object::Reference(xobj_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.has_decodable_text_fonts,
+            "P2: decodable font from Form XObject should be detected"
+        );
+        assert!(
+            !analysis.has_identity_h_no_tounicode,
+            "P2: no Identity-H font used, should not flag"
         );
     }
 }
