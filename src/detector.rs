@@ -223,7 +223,15 @@ pub(crate) fn detect_from_document(
             if analysis.has_images {
                 pages_with_images += 1;
             }
-            if analysis.has_template_image {
+            // Only count as a template-image page if it looks like a scan
+            // (single full-page image) rather than a text page with figures.
+            // Scanned-with-OCR PDFs have 1 large image per page + OCR text overlay;
+            // text PDFs with figures have multiple smaller images alongside real text.
+            if analysis.has_template_image
+                && (analysis.image_count <= 1
+                    || analysis.text_operator_count < 50
+                    || analysis.unique_alphanum_chars < 10)
+            {
                 pages_with_template_images += 1;
             }
             if analysis.has_vector_text {
@@ -350,7 +358,12 @@ pub(crate) fn detect_from_document(
                 } else {
                     continue;
                 };
-                if analysis.has_template_image
+                // Template images only need OCR when it looks like a scan
+                // (single full-page image) rather than figures alongside text.
+                let looks_like_scan = analysis.image_count <= 1
+                    || analysis.text_operator_count < 50
+                    || analysis.unique_alphanum_chars < 10;
+                if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
@@ -865,10 +878,17 @@ fn scan_content_for_text_operators(
                 }
             } else if next == b'f' {
                 // Tf = set font operator
+                // Some PDFs concatenate Tf with the next operator without
+                // whitespace (e.g. "25 Tf[<01>..." or "25 Tf(<text>..."),
+                // so also accept '[', '(', '<', '/' as valid followers.
                 if i + 2 >= content.len()
                     || content[i + 2].is_ascii_whitespace()
                     || content[i + 2] == b'\n'
                     || content[i + 2] == b'\r'
+                    || content[i + 2] == b'['
+                    || content[i + 2] == b'('
+                    || content[i + 2] == b'<'
+                    || content[i + 2] == b'/'
                 {
                     font_changes += 1;
                 }
@@ -1611,6 +1631,39 @@ mod tests {
         let (ops, _, _, fonts) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 2);
         assert_eq!(fonts, 2);
+    }
+
+    #[test]
+    fn test_tf_without_trailing_whitespace() {
+        // Some PDFs concatenate Tf directly with the next operator's operand,
+        // e.g. "25 Tf[<01>..." or "25 Tf(<text>..."
+        let mut uchars = HashSet::new();
+
+        // Tf followed by '[' (TJ array start)
+        let content = b"BT /F1 25 Tf[<01>1<02>-1] TJ ET";
+        let (ops, _, _, fonts) = scan_content_for_text_operators(content, &mut uchars);
+        assert_eq!(fonts, 1, "Tf followed by '[' should be counted");
+        assert_eq!(ops, 1);
+
+        // Tf followed by '(' (literal string)
+        uchars.clear();
+        let content2 = b"BT /F1 12 Tf(Hello) Tj ET";
+        let (ops2, _, _, fonts2) = scan_content_for_text_operators(content2, &mut uchars);
+        assert_eq!(fonts2, 1, "Tf followed by '(' should be counted");
+        assert_eq!(ops2, 1);
+
+        // Tf followed by '<' (hex string)
+        uchars.clear();
+        let content3 = b"BT /F1 12 Tf<0102> Tj ET";
+        let (ops3, _, _, fonts3) = scan_content_for_text_operators(content3, &mut uchars);
+        assert_eq!(fonts3, 1, "Tf followed by '<' should be counted");
+        assert_eq!(ops3, 1);
+
+        // Tf followed by '/' (next font name)
+        uchars.clear();
+        let content4 = b"BT /F1 12 Tf/F2 10 Tf (x) Tj ET";
+        let (_, _, _, fonts4) = scan_content_for_text_operators(content4, &mut uchars);
+        assert_eq!(fonts4, 2, "Tf followed by '/' should be counted");
     }
 
     #[test]
