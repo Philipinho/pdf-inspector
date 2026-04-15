@@ -1023,31 +1023,27 @@ fn process_document(
             options.page_filter.as_ref(),
         );
 
-        // For Mixed/template PDFs: if normal extraction produces garbage text
-        // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
-        // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
-                let sample: String = items.iter().take(200).map(|i| i.text.as_str()).collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
-                    extractor::extract_positioned_text_include_invisible(
-                        &doc,
-                        &font_cmaps,
-                        options.page_filter.as_ref(),
-                    )
-                } else {
-                    result
-                }
-            } else {
-                // Normal extraction failed — try invisible as fallback
+        // If normal extraction produces garbage text or is empty, retry with
+        // invisible (Tr=3) text included. This unlocks OCR text layers behind
+        // scanned images regardless of PDF type classification.
+        if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+            let sample: String = items.iter().take(200).map(|i| i.text.as_str()).collect();
+            if is_garbage_text(&sample) || sample.trim().is_empty() {
                 extractor::extract_positioned_text_include_invisible(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
                 )
+            } else {
+                result
             }
         } else {
-            result
+            // Normal extraction failed — try invisible as fallback
+            extractor::extract_positioned_text_include_invisible(
+                &doc,
+                &font_cmaps,
+                options.page_filter.as_ref(),
+            )
         }
     };
 

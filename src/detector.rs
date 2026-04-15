@@ -185,7 +185,6 @@ pub(crate) fn detect_from_document(
 
     let mut pages_with_text = 0u32;
     let mut pages_with_images = 0u32;
-    let mut pages_with_template_images = 0u32;
     let mut pages_with_vector_text = 0u32;
     let mut total_text_ops = 0u32;
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
@@ -223,17 +222,13 @@ pub(crate) fn detect_from_document(
             if analysis.has_images {
                 pages_with_images += 1;
             }
-            // Only count as a template-image page if it looks like a scan
-            // (single full-page image) rather than a text page with figures.
-            // Scanned-with-OCR PDFs have 1 large image per page + OCR text overlay;
-            // text PDFs with figures have multiple smaller images alongside real text.
-            if analysis.has_template_image
-                && (analysis.image_count <= 1
-                    || analysis.text_operator_count < 50
-                    || analysis.unique_alphanum_chars < 10)
-            {
-                pages_with_template_images += 1;
-            }
+            // Template images (large background/figure images) no longer
+            // influence page classification. In the region-based pipeline,
+            // text regions are extracted independently from image regions,
+            // and per-region `needs_ocr` quality checks handle garbage text
+            // from scanned-with-OCR pages. Counting template images here
+            // caused false OCR recommendations for text PDFs with figures
+            // (e.g. academic papers, reports with charts).
             if analysis.has_vector_text {
                 pages_with_vector_text += 1;
             }
@@ -260,26 +255,13 @@ pub(crate) fn detect_from_document(
         0.0
     };
 
-    // Check if this is a template-based PDF (images provide essential context)
-    // Template PDFs have text AND large background images on most pages
-    let has_template_images = pages_with_template_images > 0;
-    let template_ratio = if pages_sampled > 0 {
-        pages_with_template_images as f32 / pages_sampled as f32
-    } else {
-        0.0
-    };
-
-    // OCR is recommended when:
-    // 1. Template images are present (text alone is insufficient), OR
-    // 2. PDF is scanned/image-based
+    // Classification logic.
+    // Template images no longer influence classification — in the region-based
+    // pipeline, text regions are extracted independently and per-region
+    // `needs_ocr` quality checks handle scanned-with-OCR garbage text.
     let ocr_recommended: bool;
 
-    // Classification logic
-    let (pdf_type, confidence) = if has_template_images && pages_with_text > 0 {
-        ocr_recommended = true;
-        // Template-based PDF: has text but images provide essential context
-        (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
-    } else if text_ratio >= config.text_page_ratio_threshold {
+    let (pdf_type, confidence) = if text_ratio >= config.text_page_ratio_threshold {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio)
     } else if pages_with_text == 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
@@ -358,13 +340,9 @@ pub(crate) fn detect_from_document(
                 } else {
                     continue;
                 };
-                // Template images only need OCR when it looks like a scan
-                // (single full-page image) rather than figures alongside text.
-                let looks_like_scan = analysis.image_count <= 1
-                    || analysis.text_operator_count < 50
-                    || analysis.unique_alphanum_chars < 10;
-                if (analysis.has_template_image && looks_like_scan)
-                    || analysis.has_vector_text
+                // Template images no longer trigger OCR — per-region
+                // quality checks handle scanned-with-OCR garbage text.
+                if analysis.has_vector_text
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
                 {
