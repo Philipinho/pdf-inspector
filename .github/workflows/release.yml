@@ -42,7 +42,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: napi
-        run: npm install
+        run: npm install --ignore-scripts
 
       - name: Build native addon
         working-directory: napi
