@@ -682,6 +682,24 @@ fn extract_page_text_items_impl(
                                         if let Some(img) =
                                             extract_image_xobject(doc, *obj_id, page_num, &ctm)
                                         {
+                                            // Emit a TextItem so the markdown generator
+                                            // can place the image at the correct position.
+                                            // The text field carries the image index.
+                                            let img_idx = images.len();
+                                            items.push(TextItem {
+                                                text: format!("{}", img_idx),
+                                                x: ctm[4],
+                                                y: ctm[5],
+                                                width: img.width as f32,
+                                                height: img.height as f32,
+                                                font: String::new(),
+                                                font_size: 0.0,
+                                                page: page_num,
+                                                is_bold: false,
+                                                is_italic: false,
+                                                item_type: ItemType::Image,
+                                                mcid: None,
+                                            });
                                             images.push(img);
                                         }
                                     }

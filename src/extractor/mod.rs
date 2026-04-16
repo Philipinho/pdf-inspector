@@ -259,7 +259,22 @@ fn extract_positioned_text_impl(
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
-        all_images.extend(page_images);
+        // Fix image indices in TextItems to be global (not per-page).
+        // Each page's image extraction starts indexing at 0, but we need
+        // indices that match the final all_images array.
+        if !page_images.is_empty() {
+            let offset = all_images.len();
+            if offset > 0 {
+                for item in &mut items {
+                    if matches!(item.item_type, crate::types::ItemType::Image) {
+                        if let Ok(idx) = item.text.parse::<usize>() {
+                            item.text = format!("{}", idx + offset);
+                        }
+                    }
+                }
+            }
+            all_images.extend(page_images);
+        }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);

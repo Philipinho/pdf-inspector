@@ -47,6 +47,29 @@ console.log(result.pagesNeedingOcr) // [5, 12, 15] (0-indexed)
 console.log(result.confidence)      // 0.875
 ```
 
+### `processPdfWithImages(buffer: Buffer, pages?: number[]): PdfResultWithImages`
+
+Process a PDF and extract both markdown and images in one call. The markdown contains `![image](pdf-image://N)` placeholders where `N` is the index into the returned `images` array.
+
+```typescript
+import { processPdfWithImages } from 'firecrawl-pdf-inspector'
+import { readFileSync } from 'fs'
+
+const result = processPdfWithImages(readFileSync('document.pdf'))
+
+console.log(result.images.length)  // 110
+console.log(result.markdown)       // "# Title\n\n![image](pdf-image://0)\n\nSome text..."
+
+// Replace placeholders with real URLs after uploading
+let content = result.markdown
+for (let i = 0; i < result.images.length; i++) {
+  const img = result.images[i]
+  const ext = img.format === 'Jpeg' ? 'jpg' : 'png'
+  const url = await uploadImage(img.data, `image-${i}.${ext}`)
+  content = content.replace(`pdf-image://${i}`, url)
+}
+```
+
 ### `extractImages(buffer: Buffer): ExtractedImage[]`
 
 Extract embedded images from a PDF as raw bytes. Supports JPEG (DCTDecode) and PNG (FlateDecode) images. Returns image data with page position and dimensions.
@@ -119,6 +142,11 @@ interface PdfResult {
   pagesWithTables: number[]
   pagesWithColumns: number[]
   hasEncodingIssues: boolean
+}
+
+// Extends PdfResult with extracted images
+interface PdfResultWithImages extends PdfResult {
+  images: ExtractedImage[]  // Indices match pdf-image://N placeholders in markdown
 }
 
 interface PdfClassification {

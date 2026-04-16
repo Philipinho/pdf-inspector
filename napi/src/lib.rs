@@ -74,6 +74,27 @@ pub struct PdfResult {
     pub has_encoding_issues: bool,
 }
 
+/// Full PDF processing result with markdown, metadata, and extracted images.
+///
+/// The markdown contains `![image](pdf-image://N)` placeholders where N
+/// is the index into the `images` array.
+#[napi(object)]
+pub struct PdfResultWithImages {
+    pub pdf_type: PdfType,
+    pub markdown: Option<String>,
+    pub page_count: u32,
+    pub processing_time_ms: u32,
+    pub pages_needing_ocr: Vec<u32>,
+    pub title: Option<String>,
+    pub confidence: f64,
+    pub is_complex_layout: bool,
+    pub pages_with_tables: Vec<u32>,
+    pub pages_with_columns: Vec<u32>,
+    pub has_encoding_issues: bool,
+    /// Extracted images. Indices match `pdf-image://N` placeholders in markdown.
+    pub images: Vec<ExtractedImage>,
+}
+
 /// Lightweight PDF classification result.
 #[napi(object)]
 pub struct PdfClassification {
@@ -207,6 +228,53 @@ pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult>
         let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
             .map_err(|e| to_napi_err(e, "process_pdf"))?;
         Ok(to_napi_result(result))
+    })
+}
+
+/// Process a PDF and extract both markdown and images.
+///
+/// The markdown contains `![image](pdf-image://N)` placeholders where N is the
+/// index into the returned `images` array.
+#[napi]
+pub fn process_pdf_with_images(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+) -> Result<PdfResultWithImages> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("process_pdf_with_images", move || {
+        let mut opts = pdf_inspector::PdfOptions::new().extract_images(true);
+        if let Some(p) = pages {
+            opts = opts.pages(p);
+        }
+        let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
+            .map_err(|e| to_napi_err(e, "process_pdf_with_images"))?;
+        let images: Vec<ExtractedImage> = result
+            .images
+            .iter()
+            .map(|img| ExtractedImage {
+                page: img.page,
+                x: img.x as f64,
+                y: img.y as f64,
+                width: img.width,
+                height: img.height,
+                format: convert_image_format(&img.format),
+                data: img.data.clone().into(),
+            })
+            .collect();
+        Ok(PdfResultWithImages {
+            pdf_type: convert_pdf_type(result.pdf_type),
+            markdown: result.markdown,
+            page_count: result.page_count,
+            processing_time_ms: result.processing_time_ms as u32,
+            pages_needing_ocr: result.pages_needing_ocr,
+            title: result.title,
+            confidence: result.confidence as f64,
+            is_complex_layout: result.layout.is_complex,
+            pages_with_tables: result.layout.pages_with_tables,
+            pages_with_columns: result.layout.pages_with_columns,
+            has_encoding_issues: result.has_encoding_issues,
+            images,
+        })
     })
 }
 

@@ -568,13 +568,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     let mut page_images: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
 
     for img in &images {
-        // Extract image name from "[Image: Im0]" format
-        let img_name = img
-            .text
-            .strip_prefix("[Image: ")
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
+        let img_md = format!("![image](pdf-image://{})\n", img.text);
         page_images
             .entry(img.page)
             .or_default()

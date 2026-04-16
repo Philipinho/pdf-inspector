@@ -82,6 +82,8 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// Extracted images (populated when `extract_images` option is set).
+    pub images: Vec<ExtractedImage>,
 }
 
 // =========================================================================
@@ -109,6 +111,9 @@ pub struct PdfOptions {
     pub markdown: MarkdownOptions,
     /// Optional set of 1-indexed pages to process.  `None` = all pages.
     pub page_filter: Option<HashSet<u32>>,
+    /// Extract embedded images and emit `![image](pdf-image://N)` placeholders
+    /// in markdown. Images are returned in `PdfProcessResult::images`.
+    pub extract_images: bool,
 }
 
 impl Default for PdfOptions {
@@ -118,6 +123,7 @@ impl Default for PdfOptions {
             detection: DetectionConfig::default(),
             markdown: MarkdownOptions::default(),
             page_filter: None,
+            extract_images: false,
         }
     }
 }
@@ -157,6 +163,13 @@ impl PdfOptions {
     /// Limit processing to specific 1-indexed pages.
     pub fn pages(mut self, pages: impl IntoIterator<Item = u32>) -> Self {
         self.page_filter = Some(pages.into_iter().collect());
+        self
+    }
+
+    /// Extract embedded images and include `![image](pdf-image://N)` placeholders
+    /// in the markdown output. Images are returned in `PdfProcessResult::images`.
+    pub fn extract_images(mut self, extract: bool) -> Self {
+        self.extract_images = extract;
         self
     }
 }
@@ -999,6 +1012,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            images: Vec::new(),
         });
     }
 
@@ -1014,17 +1028,26 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            images: Vec::new(),
         });
     }
 
     // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let result = extractor::extract_positioned_text_from_doc(
-            &doc,
-            &font_cmaps,
-            options.page_filter.as_ref(),
-        );
+        let result = if options.extract_images {
+            extractor::extract_text_and_images_from_doc(
+                &doc,
+                &font_cmaps,
+                options.page_filter.as_ref(),
+            )
+        } else {
+            extractor::extract_positioned_text_from_doc(
+                &doc,
+                &font_cmaps,
+                options.page_filter.as_ref(),
+            )
+        };
 
         // For Mixed/template PDFs: if normal extraction produces garbage text
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
@@ -1080,8 +1103,8 @@ fn process_document(
         })
         .unwrap_or((None, Vec::new()));
 
-    let (markdown, layout, has_encoding_issues, gid_pages) = match extracted {
-        Some(((items, rects, lines), _extracted_images, page_thresholds, gid_encoded_pages)) => {
+    let (markdown, layout, has_encoding_issues, gid_pages, extracted_images) = match extracted {
+        Some(((items, rects, lines), extracted_images, page_thresholds, gid_encoded_pages)) => {
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
             // passthrough actually produced readable text.  If a page's text
@@ -1147,13 +1170,14 @@ fn process_document(
             };
 
             let enc = md.as_ref().is_some_and(|m| detect_encoding_issues(m));
-            (md, layout, enc, gid_encoded_pages)
+            (md, layout, enc, gid_encoded_pages, extracted_images)
         }
         None => (
             None,
             LayoutComplexity::default(),
             false,
             std::collections::HashSet::new(),
+            Vec::new(),
         ),
     };
 
@@ -1237,6 +1261,7 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        images: extracted_images,
     })
 }
 
