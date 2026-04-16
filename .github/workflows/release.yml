@@ -1,0 +1,96 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            napi/target/
+          key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-napi-
+
+      - name: Install dependencies
+        working-directory: napi
+        run: npm install
+
+      - name: Build native addon
+        working-directory: napi
+        run: npx napi build --platform --release
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: napi/*.node
+          if-no-files-found: error
+
+      - name: Upload generated JS bindings
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-bindings
+          path: |
+            napi/index.js
+            napi/index.d.ts
+            napi/package.json
+            napi/README.md
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release
+        run: |
+          mkdir -p release-pkg
+          cp artifacts/js-bindings/* release-pkg/
+          cp artifacts/bindings-*/*.node release-pkg/
+          echo "=== Release contents ==="
+          ls -la release-pkg/
+          cd release-pkg && tar czf ../pdf-inspector-prebuilt.tar.gz .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pdf-inspector-prebuilt.tar.gz
+          generate_release_notes: true
