@@ -15,7 +15,7 @@ use super::{get_number, multiply_matrices};
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
 pub(crate) enum XObjectType {
-    Image,
+    Image(ObjectId),
     Form(ObjectId),
 }
 
@@ -93,7 +93,7 @@ fn collect_xobjects_from_dict(
                         if let Ok(subtype) = stream.dict.get(b"Subtype") {
                             if let Ok(subtype_name) = subtype.as_name() {
                                 if subtype_name == b"Image" {
-                                    xobject_types.insert(name_str, XObjectType::Image);
+                                    xobject_types.insert(name_str, XObjectType::Image(obj_ref));
                                 } else if subtype_name == b"Form" {
                                     xobject_types.insert(name_str, XObjectType::Form(obj_ref));
                                 }

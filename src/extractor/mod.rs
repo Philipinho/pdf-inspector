@@ -10,14 +10,13 @@ mod xobjects;
 
 use crate::text_utils::is_rtl_text;
 use crate::tounicode::FontCMaps;
-use crate::types::{PageExtraction, TextItem};
+use crate::types::{ExtractedImage, PageExtraction, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -99,7 +98,7 @@ pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
         Err(e) => return Err(e.into()),
     };
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _images, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -118,6 +117,25 @@ pub fn extract_text_with_positions_mem_pages(
     Ok(items)
 }
 
+/// Extract images from PDF memory buffer.
+///
+/// Extracts JPEG (DCTDecode) and PNG (FlateDecode) images.
+/// Returns raw image bytes with position and dimension metadata.
+pub fn extract_images_mem(buffer: &[u8]) -> Result<Vec<ExtractedImage>, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let doc = match Document::load_mem(buffer) {
+        Ok(d) => d,
+        Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
+            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let (_extraction, images, _thresholds, _gid_pages) =
+        extract_text_and_images_from_doc(&doc, &font_cmaps, None)?;
+    Ok(images)
+}
+
 /// Extract text with positions and rectangles from memory buffer.
 pub(crate) fn extract_text_with_positions_mem_and_rects(
     buffer: &[u8],
@@ -132,7 +150,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
         Err(e) => return Err(e.into()),
     };
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _images, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -151,8 +169,8 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false)
+) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, false)
 }
 
 /// Extract with option to include invisible (Tr=3) text.
@@ -161,8 +179,17 @@ pub(crate) fn extract_positioned_text_include_invisible(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, true)
+) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, true, false)
+}
+
+/// Extract text and images together.
+pub(crate) fn extract_text_and_images_from_doc(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, true)
 }
 
 fn extract_positioned_text_impl(
@@ -170,11 +197,13 @@ fn extract_positioned_text_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    extract_images_flag: bool,
+) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
+    let mut all_images: Vec<ExtractedImage> = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
 
@@ -188,11 +217,17 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) =
-            extract_page_text_items(doc, page_id, *page_num, font_cmaps, include_invisible)?;
+        let extractor_fn = if extract_images_flag {
+            content_stream::extract_page_text_and_images
+        } else {
+            content_stream::extract_page_text_items
+        };
+        let ((mut items, rects, lines), page_images, has_gid_fonts, _coords_rotated) =
+            extractor_fn(doc, page_id, *page_num, font_cmaps, include_invisible)?;
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
+        all_images.extend(page_images);
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -242,6 +277,7 @@ fn extract_positioned_text_impl(
 
     Ok((
         (all_items, all_rects, all_lines),
+        all_images,
         page_thresholds,
         gid_encoded_pages,
     ))

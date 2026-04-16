@@ -41,12 +41,12 @@ pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
-pub use extractor::{extract_text, extract_text_with_positions, extract_text_with_positions_pages};
+pub use extractor::{extract_images_mem, extract_text, extract_text_with_positions, extract_text_with_positions_pages};
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{ExtractedImage, ImageFormat, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{HashMap, HashSet};
@@ -353,7 +353,7 @@ pub fn extract_pages_markdown_mem(
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats.
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), _images, page_thresholds, gid_pages) =
         extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
 
     // Compute layout complexity from full document (near-zero cost).
@@ -514,7 +514,7 @@ pub fn extract_text_in_regions_mem(
         page_heights.insert(*page_num, height);
 
         // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), _page_images, has_gid, coords_rotated) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -622,7 +622,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), _page_images, has_gid, coords_rotated) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1027,7 +1027,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _imgs, _, _)| e) {
                 let sample: String = items.iter().take(200).map(|i| i.text.as_str()).collect();
                 if is_garbage_text(&sample) || sample.trim().is_empty() {
                     extractor::extract_positioned_text_include_invisible(
@@ -1078,7 +1078,7 @@ fn process_document(
         .unwrap_or((None, Vec::new()));
 
     let (markdown, layout, has_encoding_issues, gid_pages) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+        Some(((items, rects, lines), _extracted_images, page_thresholds, gid_encoded_pages)) => {
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
             // passthrough actually produced readable text.  If a page's text

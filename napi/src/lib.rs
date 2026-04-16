@@ -27,6 +27,32 @@ pub enum ItemType {
     FormField,
 }
 
+/// Image format for extracted images.
+#[napi(string_enum)]
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+}
+
+/// An image extracted from a PDF.
+#[napi(object)]
+pub struct ExtractedImage {
+    /// Page number (1-indexed).
+    pub page: u32,
+    /// X position on page.
+    pub x: f64,
+    /// Y position on page.
+    pub y: f64,
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Image format.
+    pub format: ImageFormat,
+    /// Raw image bytes.
+    pub data: Buffer,
+}
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
@@ -411,4 +437,36 @@ fn to_page_region_texts(results: Vec<pdf_inspector::PageRegionResult>) -> Vec<Pa
                 .collect(),
         })
         .collect()
+}
+
+fn convert_image_format(f: &pdf_inspector::ImageFormat) -> ImageFormat {
+    match f {
+        pdf_inspector::ImageFormat::Jpeg => ImageFormat::Jpeg,
+        pdf_inspector::ImageFormat::Png => ImageFormat::Png,
+    }
+}
+
+/// Extract images from a PDF Buffer.
+///
+/// Currently extracts JPEG images (DCTDecode filter) only.
+/// Returns raw image bytes with position and dimension metadata.
+#[napi]
+pub fn extract_images(buffer: Buffer) -> Result<Vec<ExtractedImage>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_images", move || {
+        let images = pdf_inspector::extract_images_mem(&bytes)
+            .map_err(|e| to_napi_err(e, "extract_images"))?;
+        Ok(images
+            .into_iter()
+            .map(|img| ExtractedImage {
+                page: img.page,
+                x: img.x as f64,
+                y: img.y as f64,
+                width: img.width,
+                height: img.height,
+                format: convert_image_format(&img.format),
+                data: img.data.into(),
+            })
+            .collect())
+    })
 }
