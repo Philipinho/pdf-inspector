@@ -1,6 +1,6 @@
 # firecrawl-pdf-inspector
 
-Fast PDF classification and region-based text extraction for Node.js/Bun. Native Rust performance via [napi-rs](https://napi.rs).
+Fast PDF classification, text extraction, and image extraction for Node.js/Bun. Native Rust performance via [napi-rs](https://napi.rs).
 
 Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract text from PDF structure where possible, fall back to OCR only when needed.
 
@@ -16,21 +16,54 @@ Prebuilt binaries included for **linux-x64** and **macOS ARM64**. No Rust toolch
 
 ## API
 
+### `processPdf(buffer: Buffer, pages?: number[]): PdfResult`
+
+Full PDF processing — classify, extract text, and convert to Markdown in one call.
+
+```typescript
+import { processPdf } from 'firecrawl-pdf-inspector'
+import { readFileSync } from 'fs'
+
+const pdf = readFileSync('document.pdf')
+const result = processPdf(pdf)
+
+console.log(result.pdfType)    // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
+console.log(result.markdown)   // Markdown string or null
+console.log(result.pageCount)  // 42
+```
+
 ### `classifyPdf(buffer: Buffer): PdfClassification`
 
 Classify a PDF as TextBased, Scanned, Mixed, or ImageBased (~10-50ms). Returns which pages need OCR.
 
 ```typescript
 import { classifyPdf } from 'firecrawl-pdf-inspector'
-import { readFileSync } from 'fs'
 
-const pdf = readFileSync('document.pdf')
-const result = classifyPdf(pdf)
+const result = classifyPdf(readFileSync('document.pdf'))
 
-console.log(result.pdfType)        // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
-console.log(result.pageCount)      // 42
+console.log(result.pdfType)         // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
+console.log(result.pageCount)       // 42
 console.log(result.pagesNeedingOcr) // [5, 12, 15] (0-indexed)
-console.log(result.confidence)     // 0.875
+console.log(result.confidence)      // 0.875
+```
+
+### `extractImages(buffer: Buffer): ExtractedImage[]`
+
+Extract embedded images from a PDF as raw bytes. Supports JPEG (DCTDecode) and PNG (FlateDecode) images. Returns image data with page position and dimensions.
+
+Image extraction is a separate function from text extraction — calling `processPdf` or `extractText` does **not** pay the cost of image decompression/encoding.
+
+```typescript
+import { extractImages } from 'firecrawl-pdf-inspector'
+import { writeFileSync } from 'fs'
+
+const images = extractImages(readFileSync('document.pdf'))
+
+for (const img of images) {
+  const ext = img.format === 'Jpeg' ? 'jpg' : 'png'
+  writeFileSync(`page${img.page}_${img.width}x${img.height}.${ext}`, img.data)
+  console.log(`Page ${img.page}: ${img.width}x${img.height} ${img.format}`)
+}
 ```
 
 ### `extractTextInRegions(buffer: Buffer, pageRegions: PageRegions[]): PageRegionTexts[]`
@@ -61,14 +94,48 @@ for (const region of result[0].regions) {
 }
 ```
 
+### `extractText(buffer: Buffer): string`
+
+Extract plain text from a PDF.
+
+```typescript
+import { extractText } from 'firecrawl-pdf-inspector'
+
+const text = extractText(readFileSync('document.pdf'))
+```
+
 ## Types
 
 ```typescript
+interface PdfResult {
+  pdfType: string          // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
+  markdown: string | null  // Markdown output
+  pageCount: number
+  processingTimeMs: number
+  pagesNeedingOcr: number[] // 1-indexed page numbers
+  title: string | null
+  confidence: number        // 0.0 - 1.0
+  isComplexLayout: boolean
+  pagesWithTables: number[]
+  pagesWithColumns: number[]
+  hasEncodingIssues: boolean
+}
+
 interface PdfClassification {
   pdfType: string          // "TextBased" | "Scanned" | "Mixed" | "ImageBased"
   pageCount: number
   pagesNeedingOcr: number[] // 0-indexed page numbers
   confidence: number        // 0.0 - 1.0
+}
+
+interface ExtractedImage {
+  page: number              // 1-indexed page number
+  x: number                 // X position on page
+  y: number                 // Y position on page
+  width: number             // Pixel width
+  height: number            // Pixel height
+  format: string            // "Jpeg" | "Png"
+  data: Buffer              // Raw image bytes (valid JPEG or PNG file)
 }
 
 interface PageRegions {
@@ -86,6 +153,23 @@ interface RegionText {
   needsOcr: boolean         // true when text is unreliable
 }
 ```
+
+## Supported image formats
+
+| PDF Filter    | Output Format | Status    |
+|---------------|---------------|-----------|
+| DCTDecode     | JPEG          | Supported |
+| FlateDecode   | PNG           | Supported |
+| JPXDecode     | JPEG2000      | Planned   |
+| CCITTFaxDecode| TIFF          | Planned   |
+
+**Color spaces:** DeviceRGB, DeviceGray, DeviceCMYK (converted to RGB), Indexed, ICCBased, CalRGB, CalGray.
+
+**Note:** Vector graphics (drawn with PDF path operators) are not raster images and cannot be extracted — they would need to be rendered.
+
+## Performance
+
+Text extraction and image extraction are independent paths. `processPdf` and `extractText` skip image processing entirely, so there is zero overhead when you only need text.
 
 ## Platforms
 

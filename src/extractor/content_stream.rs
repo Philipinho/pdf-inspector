@@ -7,7 +7,7 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{ExtractedImage, ImageFormat, ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -82,10 +82,32 @@ pub(crate) fn extract_page_text_items(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-) -> Result<(PageExtraction, bool, bool), PdfError> {
+) -> Result<(PageExtraction, Vec<ExtractedImage>, bool, bool), PdfError> {
+    extract_page_text_items_impl(doc, page_id, page_num, font_cmaps, include_invisible, false)
+}
+
+pub(crate) fn extract_page_text_and_images(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+) -> Result<(PageExtraction, Vec<ExtractedImage>, bool, bool), PdfError> {
+    extract_page_text_items_impl(doc, page_id, page_num, font_cmaps, include_invisible, true)
+}
+
+fn extract_page_text_items_impl(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    extract_images_flag: bool,
+) -> Result<(PageExtraction, Vec<ExtractedImage>, bool, bool), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
+    let mut images: Vec<ExtractedImage> = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
@@ -182,7 +204,7 @@ pub(crate) fn extract_page_text_items(
             content.operations.len(),
             MAX_OPERATIONS
         );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false));
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), Vec::new(), false, false));
     }
 
     // Graphics state tracking
@@ -648,8 +670,12 @@ pub(crate) fn extract_page_text_items(
 
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
                             match xobj_type {
-                                XObjectType::Image => {
-                                    // Skip images — text extraction only
+                                XObjectType::Image(obj_id) => {
+                                    if extract_images_flag {
+                                        if let Some(img) = extract_image_xobject(doc, *obj_id, page_num, &ctm) {
+                                            images.push(img);
+                                        }
+                                    }
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
@@ -1014,7 +1040,340 @@ pub(crate) fn extract_page_text_items(
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
-    Ok(((items, rects, lines), has_gid_fonts, coords_rotated))
+    Ok(((items, rects, lines), images, has_gid_fonts, coords_rotated))
+}
+
+// ---------------------------------------------------------------------------
+// Image extraction helpers
+// ---------------------------------------------------------------------------
+
+/// Extract an image from an XObject stream, returning an `ExtractedImage`
+/// if the filter is supported (DCTDecode / FlateDecode).
+fn extract_image_xobject(
+    doc: &Document,
+    obj_id: ObjectId,
+    page_num: u32,
+    ctm: &[f32; 6],
+) -> Option<ExtractedImage> {
+    let stream = match doc.get_object(obj_id) {
+        Ok(Object::Stream(s)) => s,
+        _ => return None,
+    };
+
+    // Filter can be a name (/FlateDecode) or array ([/FlateDecode])
+    let filter = stream.dict.get(b"Filter")
+        .ok()
+        .and_then(|f| {
+            if let Ok(name) = f.as_name() {
+                Some(name.to_vec())
+            } else if let Ok(arr) = f.as_array() {
+                // Single-element array like [/FlateDecode]
+                if arr.len() == 1 {
+                    arr[0].as_name().ok().map(|n| n.to_vec())
+                } else {
+                    None // chained filters — not supported yet
+                }
+            } else {
+                None
+            }
+        });
+
+    let width = stream.dict.get(b"Width")
+        .ok()
+        .and_then(|w| w.as_i64().ok())
+        .unwrap_or(0) as u32;
+    let height = stream.dict.get(b"Height")
+        .ok()
+        .and_then(|h| h.as_i64().ok())
+        .unwrap_or(0) as u32;
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    match filter.as_deref() {
+        Some(b"DCTDecode") => {
+            // JPEG — raw stream content is the JPEG file
+            Some(ExtractedImage {
+                page: page_num,
+                x: ctm[4],
+                y: ctm[5],
+                width,
+                height,
+                format: ImageFormat::Jpeg,
+                data: stream.content.clone(),
+            })
+        }
+        Some(b"FlateDecode") => {
+            encode_flatedecode_to_png(stream, width, height, page_num, ctm)
+        }
+        _ => None,
+    }
+}
+
+/// Color space info resolved from a PDF image dictionary.
+struct ImageColorInfo {
+    png_color_type: png::ColorType,
+    channels: u8,
+    is_cmyk: bool,
+}
+
+/// Decompress a FlateDecode image stream and encode it as PNG.
+///
+/// Handles DeviceRGB, DeviceGray, DeviceCMYK color spaces.
+/// Handles PNG predictor filters (Predictor >= 10 in DecodeParms).
+/// Skips unsupported color spaces (Indexed, etc.) instead of crashing.
+fn encode_flatedecode_to_png(
+    stream: &lopdf::Stream,
+    width: u32,
+    height: u32,
+    page_num: u32,
+    ctm: &[f32; 6],
+) -> Option<ExtractedImage> {
+    // Decompress the stream
+    let raw = stream.decompressed_content().ok()?;
+
+    let bpc = stream.dict.get(b"BitsPerComponent")
+        .ok()
+        .and_then(|b| b.as_i64().ok())
+        .unwrap_or(8) as u8;
+
+    let color_info = resolve_color_space(&stream.dict)?;
+
+    // Check for PNG predictor in DecodeParms
+    let has_png_predictor = stream.dict.get(b"DecodeParms")
+        .ok()
+        .and_then(|dp| dp.as_dict().ok())
+        .and_then(|dp| dp.get(b"Predictor").ok())
+        .and_then(|p| p.as_i64().ok())
+        .map(|p| p >= 10)
+        .unwrap_or(false);
+
+    // Calculate expected row size (bytes per row of pixel data, no filter byte)
+    let bits_per_row = width as usize * color_info.channels as usize * bpc as usize;
+    let bytes_per_row = (bits_per_row + 7) / 8;
+
+    // Prepare pixel data: strip PNG predictor filter bytes if present
+    let pixel_data = if has_png_predictor {
+        let stride = bytes_per_row + 1; // +1 for filter byte
+        if raw.len() < stride * height as usize {
+            return None;
+        }
+        unfilter_png_rows(&raw, width, height, bytes_per_row, color_info.channels as usize, bpc)
+    } else {
+        if raw.len() < bytes_per_row * height as usize {
+            return None;
+        }
+        // Truncate to exact expected size to avoid PNG encoder errors
+        raw[..bytes_per_row * height as usize].to_vec()
+    };
+
+    // Handle CMYK → RGB conversion
+    let (final_data, final_color_type) = if color_info.is_cmyk {
+        let rgb = cmyk_to_rgb(&pixel_data, width, height);
+        (rgb, png::ColorType::Rgb)
+    } else {
+        (pixel_data, color_info.png_color_type)
+    };
+
+    // Encode to PNG
+    let mut png_buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_buf, width, height);
+        encoder.set_color(final_color_type);
+        encoder.set_depth(match bpc {
+            1 => png::BitDepth::One,
+            2 => png::BitDepth::Two,
+            4 => png::BitDepth::Four,
+            16 => png::BitDepth::Sixteen,
+            _ => png::BitDepth::Eight,
+        });
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&final_data).ok()?;
+    }
+
+    Some(ExtractedImage {
+        page: page_num,
+        x: ctm[4],
+        y: ctm[5],
+        width,
+        height,
+        format: ImageFormat::Png,
+        data: png_buf,
+    })
+}
+
+/// Resolve PDF ColorSpace to PNG color type and channel count.
+///
+/// Returns `None` for unsupported color spaces (Indexed, patterns, etc.)
+/// to skip the image rather than crash.
+fn resolve_color_space(dict: &lopdf::Dictionary) -> Option<ImageColorInfo> {
+    let cs = dict.get(b"ColorSpace")
+        .ok()
+        .and_then(|cs| {
+            if let Ok(name) = cs.as_name() {
+                Some(name.to_vec())
+            } else if let Ok(arr) = cs.as_array() {
+                arr.first().and_then(|v| v.as_name().ok()).map(|n| n.to_vec())
+            } else {
+                None
+            }
+        });
+
+    match cs.as_deref() {
+        Some(b"DeviceRGB") | Some(b"CalRGB") => Some(ImageColorInfo {
+            png_color_type: png::ColorType::Rgb,
+            channels: 3,
+            is_cmyk: false,
+        }),
+        Some(b"DeviceGray") | Some(b"CalGray") => Some(ImageColorInfo {
+            png_color_type: png::ColorType::Grayscale,
+            channels: 1,
+            is_cmyk: false,
+        }),
+        Some(b"DeviceCMYK") => Some(ImageColorInfo {
+            png_color_type: png::ColorType::Rgb, // will be converted
+            channels: 4,
+            is_cmyk: true,
+        }),
+        Some(b"ICCBased") => {
+            // ICCBased: [/ICCBased stream_ref]. Infer channels from BPC + data,
+            // or fall back to RGB. Safe to guess RGB(3) for most ICC profiles.
+            Some(ImageColorInfo {
+                png_color_type: png::ColorType::Rgb,
+                channels: 3,
+                is_cmyk: false,
+            })
+        }
+        Some(b"Indexed") => {
+            // Indexed requires a PLTE chunk which we don't extract.
+            // Skip rather than crash.
+            None
+        }
+        None => {
+            // No ColorSpace specified — default to RGB
+            Some(ImageColorInfo {
+                png_color_type: png::ColorType::Rgb,
+                channels: 3,
+                is_cmyk: false,
+            })
+        }
+        _ => None, // Unknown color space — skip
+    }
+}
+
+/// Apply PNG un-filtering to rows with predictor filter bytes.
+///
+/// PDF spec §7.4.4.4: Predictor values 10–15 correspond to PNG filter types
+/// (None=0, Sub=1, Up=2, Average=3, Paeth=4).
+fn unfilter_png_rows(
+    data: &[u8],
+    _width: u32,
+    height: u32,
+    bytes_per_row: usize,
+    channels: usize,
+    bpc: u8,
+) -> Vec<u8> {
+    let stride = bytes_per_row + 1; // row data + filter byte
+    let bpp = std::cmp::max(1, (channels * bpc as usize) / 8); // bytes per pixel
+    let mut result = vec![0u8; bytes_per_row * height as usize];
+    let mut prev_row = vec![0u8; bytes_per_row];
+
+    for row in 0..height as usize {
+        let src_offset = row * stride;
+        if src_offset >= data.len() {
+            break;
+        }
+        let filter_type = data[src_offset];
+        let src_start = src_offset + 1;
+        let src_end = std::cmp::min(src_start + bytes_per_row, data.len());
+        let dst_start = row * bytes_per_row;
+
+        let row_data = &data[src_start..src_end];
+        let dst = &mut result[dst_start..dst_start + bytes_per_row];
+
+        match filter_type {
+            0 => {
+                // None
+                dst[..row_data.len()].copy_from_slice(row_data);
+            }
+            1 => {
+                // Sub: each byte is added to the byte `bpp` positions to the left
+                for i in 0..row_data.len() {
+                    let left = if i >= bpp { dst[i - bpp] } else { 0 };
+                    dst[i] = row_data[i].wrapping_add(left);
+                }
+            }
+            2 => {
+                // Up: each byte is added to the byte directly above
+                for i in 0..row_data.len() {
+                    dst[i] = row_data[i].wrapping_add(prev_row[i]);
+                }
+            }
+            3 => {
+                // Average: each byte uses the average of left and above
+                for i in 0..row_data.len() {
+                    let left = if i >= bpp { dst[i - bpp] as u16 } else { 0 };
+                    let above = prev_row[i] as u16;
+                    dst[i] = row_data[i].wrapping_add(((left + above) / 2) as u8);
+                }
+            }
+            4 => {
+                // Paeth: each byte uses the Paeth predictor of left, above, upper-left
+                for i in 0..row_data.len() {
+                    let left = if i >= bpp { dst[i - bpp] as i32 } else { 0 };
+                    let above = prev_row[i] as i32;
+                    let upper_left = if i >= bpp { prev_row[i - bpp] as i32 } else { 0 };
+                    dst[i] = row_data[i].wrapping_add(paeth_predictor(left, above, upper_left));
+                }
+            }
+            _ => {
+                // Unknown filter — treat as None
+                dst[..row_data.len()].copy_from_slice(row_data);
+            }
+        }
+
+        prev_row[..bytes_per_row].copy_from_slice(dst);
+    }
+
+    result
+}
+
+#[inline]
+fn paeth_predictor(a: i32, b: i32, c: i32) -> u8 {
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
+/// Convert CMYK pixel data to RGB.
+///
+/// Uses the standard formula: R = 255 × (1-C) × (1-K), etc.
+fn cmyk_to_rgb(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let pixel_count = (width * height) as usize;
+    let mut rgb = Vec::with_capacity(pixel_count * 3);
+    for i in 0..pixel_count {
+        let offset = i * 4;
+        if offset + 3 >= data.len() {
+            break;
+        }
+        let c = data[offset] as f32 / 255.0;
+        let m = data[offset + 1] as f32 / 255.0;
+        let y = data[offset + 2] as f32 / 255.0;
+        let k = data[offset + 3] as f32 / 255.0;
+        rgb.push((255.0 * (1.0 - c) * (1.0 - k)) as u8);
+        rgb.push((255.0 * (1.0 - m) * (1.0 - k)) as u8);
+        rgb.push((255.0 * (1.0 - y) * (1.0 - k)) as u8);
+    }
+    rgb
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1229,7 +1588,7 @@ mod tests {
 
         let font_cmaps = FontCMaps::from_doc(&doc);
         let result = extract_page_text_items(&doc, page_id, 1, &font_cmaps, false).unwrap();
-        let ((items, rects, lines), _has_gid, _coords_rotated) = result;
+        let ((items, rects, lines), _images, _has_gid, _coords_rotated) = result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());

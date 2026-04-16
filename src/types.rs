@@ -59,6 +59,35 @@ pub enum ItemType {
     FormField,
 }
 
+/// Image format for extracted images.
+#[derive(Debug, Clone)]
+pub enum ImageFormat {
+    /// JPEG image (DCTDecode filter) — raw stream content is a valid JPEG file.
+    Jpeg,
+    /// PNG image (FlateDecode filter) — raw pixels encoded to PNG.
+    Png,
+    // TODO: Jpeg2000 (JPXDecode), Tiff (CCITTFaxDecode)
+}
+
+/// An image extracted from a PDF.
+#[derive(Debug, Clone)]
+pub struct ExtractedImage {
+    /// Page number (1-indexed).
+    pub page: u32,
+    /// X position on page (from CTM).
+    pub x: f32,
+    /// Y position on page (from CTM).
+    pub y: f32,
+    /// Pixel width from PDF image dictionary.
+    pub width: u32,
+    /// Pixel height from PDF image dictionary.
+    pub height: u32,
+    /// Image format.
+    pub format: ImageFormat,
+    /// Raw image bytes.
+    pub data: Vec<u8>,
+}
+
 /// Layout complexity analysis result.
 ///
 /// Callers can use this to decide whether the extracted markdown is reliable
