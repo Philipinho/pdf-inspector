@@ -41,7 +41,10 @@ pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
-pub use extractor::{extract_images_mem, extract_text, extract_text_with_positions, extract_text_with_positions_pages};
+pub use extractor::{
+    extract_images_mem, extract_text, extract_text_with_positions,
+    extract_text_with_positions_pages,
+};
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };

@@ -169,7 +169,15 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<
+    (
+        PageExtraction,
+        Vec<ExtractedImage>,
+        PageThresholds,
+        HashSet<u32>,
+    ),
+    PdfError,
+> {
     extract_positioned_text_impl(doc, font_cmaps, page_filter, false, false)
 }
 
@@ -179,7 +187,15 @@ pub(crate) fn extract_positioned_text_include_invisible(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<
+    (
+        PageExtraction,
+        Vec<ExtractedImage>,
+        PageThresholds,
+        HashSet<u32>,
+    ),
+    PdfError,
+> {
     extract_positioned_text_impl(doc, font_cmaps, page_filter, true, false)
 }
 
@@ -188,7 +204,15 @@ pub(crate) fn extract_text_and_images_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<
+    (
+        PageExtraction,
+        Vec<ExtractedImage>,
+        PageThresholds,
+        HashSet<u32>,
+    ),
+    PdfError,
+> {
     extract_positioned_text_impl(doc, font_cmaps, page_filter, false, true)
 }
 
@@ -198,7 +222,15 @@ fn extract_positioned_text_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     extract_images_flag: bool,
-) -> Result<(PageExtraction, Vec<ExtractedImage>, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<
+    (
+        PageExtraction,
+        Vec<ExtractedImage>,
+        PageThresholds,
+        HashSet<u32>,
+    ),
+    PdfError,
+> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();

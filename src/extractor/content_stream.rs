@@ -7,7 +7,9 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ExtractedImage, ImageFormat, ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{
+    ExtractedImage, ImageFormat, ItemType, PageExtraction, PdfLine, PdfRect, TextItem,
+};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -204,7 +206,12 @@ fn extract_page_text_items_impl(
             content.operations.len(),
             MAX_OPERATIONS
         );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), Vec::new(), false, false));
+        return Ok((
+            (Vec::new(), Vec::new(), Vec::new()),
+            Vec::new(),
+            false,
+            false,
+        ));
     }
 
     // Graphics state tracking
@@ -672,7 +679,9 @@ fn extract_page_text_items_impl(
                             match xobj_type {
                                 XObjectType::Image(obj_id) => {
                                     if extract_images_flag {
-                                        if let Some(img) = extract_image_xobject(doc, *obj_id, page_num, &ctm) {
+                                        if let Some(img) =
+                                            extract_image_xobject(doc, *obj_id, page_num, &ctm)
+                                        {
                                             images.push(img);
                                         }
                                     }
@@ -1061,28 +1070,30 @@ fn extract_image_xobject(
     };
 
     // Filter can be a name (/FlateDecode) or array ([/FlateDecode])
-    let filter = stream.dict.get(b"Filter")
-        .ok()
-        .and_then(|f| {
-            if let Ok(name) = f.as_name() {
-                Some(name.to_vec())
-            } else if let Ok(arr) = f.as_array() {
-                // Single-element array like [/FlateDecode]
-                if arr.len() == 1 {
-                    arr[0].as_name().ok().map(|n| n.to_vec())
-                } else {
-                    None // chained filters — not supported yet
-                }
+    let filter = stream.dict.get(b"Filter").ok().and_then(|f| {
+        if let Ok(name) = f.as_name() {
+            Some(name.to_vec())
+        } else if let Ok(arr) = f.as_array() {
+            // Single-element array like [/FlateDecode]
+            if arr.len() == 1 {
+                arr[0].as_name().ok().map(|n| n.to_vec())
             } else {
-                None
+                None // chained filters — not supported yet
             }
-        });
+        } else {
+            None
+        }
+    });
 
-    let width = stream.dict.get(b"Width")
+    let width = stream
+        .dict
+        .get(b"Width")
         .ok()
         .and_then(|w| w.as_i64().ok())
         .unwrap_or(0) as u32;
-    let height = stream.dict.get(b"Height")
+    let height = stream
+        .dict
+        .get(b"Height")
         .ok()
         .and_then(|h| h.as_i64().ok())
         .unwrap_or(0) as u32;
@@ -1104,9 +1115,7 @@ fn extract_image_xobject(
                 data: stream.content.clone(),
             })
         }
-        Some(b"FlateDecode") => {
-            encode_flatedecode_to_png(stream, width, height, page_num, ctm)
-        }
+        Some(b"FlateDecode") => encode_flatedecode_to_png(stream, width, height, page_num, ctm),
         _ => None,
     }
 }
@@ -1133,7 +1142,9 @@ fn encode_flatedecode_to_png(
     // Decompress the stream
     let raw = stream.decompressed_content().ok()?;
 
-    let bpc = stream.dict.get(b"BitsPerComponent")
+    let bpc = stream
+        .dict
+        .get(b"BitsPerComponent")
         .ok()
         .and_then(|b| b.as_i64().ok())
         .unwrap_or(8) as u8;
@@ -1141,7 +1152,9 @@ fn encode_flatedecode_to_png(
     let color_info = resolve_color_space(&stream.dict)?;
 
     // Check for PNG predictor in DecodeParms
-    let has_png_predictor = stream.dict.get(b"DecodeParms")
+    let has_png_predictor = stream
+        .dict
+        .get(b"DecodeParms")
         .ok()
         .and_then(|dp| dp.as_dict().ok())
         .and_then(|dp| dp.get(b"Predictor").ok())
@@ -1151,7 +1164,7 @@ fn encode_flatedecode_to_png(
 
     // Calculate expected row size (bytes per row of pixel data, no filter byte)
     let bits_per_row = width as usize * color_info.channels as usize * bpc as usize;
-    let bytes_per_row = (bits_per_row + 7) / 8;
+    let bytes_per_row = bits_per_row.div_ceil(8);
 
     // Prepare pixel data: strip PNG predictor filter bytes if present
     let pixel_data = if has_png_predictor {
@@ -1159,7 +1172,14 @@ fn encode_flatedecode_to_png(
         if raw.len() < stride * height as usize {
             return None;
         }
-        unfilter_png_rows(&raw, width, height, bytes_per_row, color_info.channels as usize, bpc)
+        unfilter_png_rows(
+            &raw,
+            width,
+            height,
+            bytes_per_row,
+            color_info.channels as usize,
+            bpc,
+        )
     } else {
         if raw.len() < bytes_per_row * height as usize {
             return None;
@@ -1208,17 +1228,17 @@ fn encode_flatedecode_to_png(
 /// Returns `None` for unsupported color spaces (Indexed, patterns, etc.)
 /// to skip the image rather than crash.
 fn resolve_color_space(dict: &lopdf::Dictionary) -> Option<ImageColorInfo> {
-    let cs = dict.get(b"ColorSpace")
-        .ok()
-        .and_then(|cs| {
-            if let Ok(name) = cs.as_name() {
-                Some(name.to_vec())
-            } else if let Ok(arr) = cs.as_array() {
-                arr.first().and_then(|v| v.as_name().ok()).map(|n| n.to_vec())
-            } else {
-                None
-            }
-        });
+    let cs = dict.get(b"ColorSpace").ok().and_then(|cs| {
+        if let Ok(name) = cs.as_name() {
+            Some(name.to_vec())
+        } else if let Ok(arr) = cs.as_array() {
+            arr.first()
+                .and_then(|v| v.as_name().ok())
+                .map(|n| n.to_vec())
+        } else {
+            None
+        }
+    });
 
     match cs.as_deref() {
         Some(b"DeviceRGB") | Some(b"CalRGB") => Some(ImageColorInfo {
@@ -1323,7 +1343,11 @@ fn unfilter_png_rows(
                 for i in 0..row_data.len() {
                     let left = if i >= bpp { dst[i - bpp] as i32 } else { 0 };
                     let above = prev_row[i] as i32;
-                    let upper_left = if i >= bpp { prev_row[i - bpp] as i32 } else { 0 };
+                    let upper_left = if i >= bpp {
+                        prev_row[i - bpp] as i32
+                    } else {
+                        0
+                    };
                     dst[i] = row_data[i].wrapping_add(paeth_predictor(left, above, upper_left));
                 }
             }
