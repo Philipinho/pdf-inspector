@@ -20,7 +20,6 @@
     "index.js",
     "index.d.ts",
     "*.node",
-    "scripts/",
     "README.md"
   ],
   "repository": {
@@ -42,7 +41,6 @@
     }
   },
   "scripts": {
-    "install": "node scripts/install.js",
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform"
   },
