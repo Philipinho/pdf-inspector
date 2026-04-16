@@ -1074,11 +1074,13 @@ fn extract_image_xobject(
         if let Ok(name) = f.as_name() {
             Some(name.to_vec())
         } else if let Ok(arr) = f.as_array() {
-            // Single-element array like [/FlateDecode]
             if arr.len() == 1 {
                 arr[0].as_name().ok().map(|n| n.to_vec())
             } else {
-                None // chained filters — not supported yet
+                // Chained filters like [/ASCII85Decode /FlateDecode]
+                arr.last()
+                    .and_then(|v| v.as_name().ok())
+                    .map(|n| n.to_vec())
             }
         } else {
             None
