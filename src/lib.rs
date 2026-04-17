@@ -1,3 +1,9 @@
+// Rust 1.95 introduced collapsible_match for `if` inside match arms.
+// The content-stream parsers use this pattern extensively (match on operator
+// name, then check `in_text_block && !op.operands.is_empty()`). Collapsing
+// these into match guards would hurt readability. Allow crate-wide.
+#![allow(clippy::collapsible_match)]
+
 //! Smart PDF detection and text extraction using lopdf
 //!
 //! # Quick start
