@@ -586,7 +586,27 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             .as_ref()
             .and_then(struct_role_heading_level)
             .filter(|level| !overused_heading_levels.contains(level));
+
+        // Protect wrapped list items: when inside a list, a visually-continuing
+        // line (same indent, line-wrap spacing) must not be reclassified as a
+        // heading by the font heuristic — PDFs often bold the lead phrase of a
+        // list item across multiple wrap lines, and an all-bold middle line
+        // would otherwise split one item into a heading + stray body text.
+        // We gate on the document's paragraph threshold so genuine section
+        // headings that follow a numbered paragraph (y_gap > para_threshold)
+        // remain detectable.
+        let looks_like_list_continuation = in_list
+            && match (last_list_x, line.items.first().map(|i| i.x)) {
+                (Some(list_x), Some(curr_x)) => {
+                    let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
+                    let y_ok = y_gap >= 0.0 && y_gap <= para_threshold;
+                    x_ok && y_ok && !is_list_item(plain_trimmed)
+                }
+                _ => false,
+            };
+
         let heuristic_heading = if options.detect_headers
+            && !looks_like_list_continuation
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !starts_with_bullet_marker(plain_trimmed)
@@ -1451,6 +1471,72 @@ mod tests {
             overused.is_empty(),
             "No heading level should be overused: {:?}",
             overused
+        );
+    }
+
+    #[test]
+    fn test_wrapped_bold_lead_in_list_item_not_heading() {
+        // Regression: numbered-list items whose bold "lead" phrase wraps onto
+        // a second line (e.g. definitions in system cards) must not have the
+        // wrapped line reclassified as a heading. The middle line is
+        // all_bold + standalone (in_paragraph=false while in_list), which
+        // previously tripped the rarity heuristic and emitted #### in the
+        // middle of the item, splitting the body into stray bullets.
+        let make = |text: &str, x: f32, y: f32, bold: bool| {
+            let mut item = make_item(text, 1, None);
+            item.x = x;
+            item.y = y;
+            item.is_bold = bold;
+            item
+        };
+
+        let lines = vec![
+            // "1. **bold lead phrase start**"
+            make_line(vec![
+                make("1. ", 72.0, 700.0, false),
+                make(
+                    "Chemical and biological weapons threat model 1 (CB-1): Non-novel",
+                    90.0,
+                    700.0,
+                    true,
+                ),
+            ]),
+            // wrapped continuation of the bold lead — all_bold, same indent
+            make_line(vec![make(
+                "chemical/biological weapons production capabilities: A model has CB-1",
+                90.0,
+                686.0,
+                true,
+            )]),
+            // body text of the same list item
+            make_line(vec![make(
+                "capabilities if it has the ability to significantly help individuals.",
+                90.0,
+                672.0,
+                false,
+            )]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            !md.contains("#### "),
+            "wrapped bold lead must not become a heading: {md}"
+        );
+        assert!(
+            md.lines().filter(|l| l.starts_with("- ")).count() == 0,
+            "continuation body must not become a stray bullet: {md}"
+        );
+        assert!(
+            md.contains("1. ") && md.contains("A model has CB-1"),
+            "numbered list item should remain intact: {md}"
         );
     }
 }
