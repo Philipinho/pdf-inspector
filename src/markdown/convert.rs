@@ -9,7 +9,9 @@ use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
     detect_header_level, font_size_rarity, has_dot_leaders,
 };
-use super::classify::{format_list_item, is_caption_line, is_list_item, is_monospace_font};
+use super::classify::{
+    format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
+};
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::MarkdownOptions;
@@ -587,6 +589,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         let heuristic_heading = if options.detect_headers
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
+            && !starts_with_bullet_marker(plain_trimmed)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
