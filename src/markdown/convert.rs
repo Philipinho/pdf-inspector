@@ -641,11 +641,16 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             continue;
         }
 
-        // Structure-tree list item (LI only — LBody is a continuation, not a new item)
+        // Structure-tree list item (LI only — LBody is a continuation, not a new item).
+        // Some tagged PDFs use a "flat" style where every wrapped line in a list item
+        // gets its own MCID tagged directly under LI. When we're already inside a list
+        // and the line has no visible bullet marker, treat it as a continuation (falls
+        // through to the continuation logic below) rather than a new list item.
         if struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::LI))
             && !is_list_item(plain_trimmed)
+            && !in_list
         {
             if in_paragraph {
                 output.push_str("\n\n");
@@ -1087,6 +1092,59 @@ mod tests {
         assert!(
             md.contains("- First item"),
             "Should format as list item: {md}"
+        );
+    }
+
+    #[test]
+    fn test_struct_role_li_flat_continuation_lines_merge() {
+        // Regression: some tagged PDFs put each wrapped visual line of a list
+        // item under its own MCID, all tagged directly as LI. Continuation
+        // lines (no bullet marker) must merge into the bulleted parent item,
+        // not each become their own list item.
+        let make = |text: &str, mcid: i64, x: f32, y: f32| {
+            let mut item = make_item(text, 1, Some(mcid));
+            item.x = x;
+            item.y = y;
+            item
+        };
+        let lines = vec![
+            make_line(vec![make("● First item that wraps onto", 0, 90.0, 322.0)]),
+            make_line(vec![make("a continuation line.", 1, 108.0, 306.0)]),
+            make_line(vec![make("● Second bullet also wraps", 2, 90.0, 290.0)]),
+            make_line(vec![make("to a second line here.", 3, 108.0, 274.0)]),
+        ];
+
+        let mut page_roles = HashMap::new();
+        for mcid in 0..4 {
+            page_roles.insert(mcid, StructRole::LI);
+        }
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(
+            md.contains("- First item that wraps onto a continuation line."),
+            "continuation should merge into first bullet: {md}"
+        );
+        assert!(
+            md.contains("- Second bullet also wraps to a second line here."),
+            "continuation should merge into second bullet: {md}"
+        );
+        assert!(
+            !md.contains("- a continuation line."),
+            "continuation line should not get its own bullet: {md}"
+        );
+        assert!(
+            !md.contains("- to a second line here."),
+            "continuation line should not get its own bullet: {md}"
         );
     }
 
