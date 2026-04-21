@@ -336,12 +336,16 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
-/// Extract formatted markdown for specific pages of a PDF, with layout
+/// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
 /// Unlike [`process_pdf_mem`] which returns one concatenated markdown string,
 /// this returns per-page markdown so callers can mix direct extraction
 /// (for simple text pages) with GPU OCR (for complex/scanned pages).
+///
+/// When `pages` is `None`, every page (0-indexed, in document order) is
+/// returned. When `Some(&[...])`, only the listed 0-indexed pages are
+/// returned, in the caller's order.
 ///
 /// Font statistics are computed from the full document so header
 /// detection thresholds are consistent regardless of which pages are
@@ -352,7 +356,7 @@ pub struct PagesExtractionResult {
 /// at near-zero cost since the items/rects/lines are already in memory.
 pub fn extract_pages_markdown_mem(
     buffer: &[u8],
-    pages: &[u32],
+    pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
@@ -368,10 +372,20 @@ pub fn extract_pages_markdown_mem(
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&all_items);
 
-    let mut results = Vec::with_capacity(pages.len());
+    // When caller doesn't specify pages, return every page in document order.
+    let all_pages: Vec<u32>;
+    let pages_slice: &[u32] = match pages {
+        Some(p) => p,
+        None => {
+            all_pages = (0..page_count).collect();
+            &all_pages
+        }
+    };
+
+    let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
 
-    for &page_0idx in pages {
+    for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
         if page_0idx >= page_count {
             pages_needing_ocr.push(page_0idx + 1);
@@ -442,6 +456,20 @@ pub fn extract_pages_markdown_mem(
         pages_needing_ocr,
         is_complex: complexity.is_complex,
     })
+}
+
+/// Path-based wrapper for [`extract_pages_markdown_mem`].
+///
+/// Reads the PDF from disk and extracts per-page markdown. Pass `None` for
+/// `pages` to return every page in document order, or `Some(&[...])` to
+/// restrict to specific 0-indexed pages (in caller-supplied order).
+pub fn extract_pages_markdown<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<PagesExtractionResult, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_pages_markdown_mem(&buffer, pages)
 }
 
 // =========================================================================

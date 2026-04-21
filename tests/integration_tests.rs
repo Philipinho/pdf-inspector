@@ -4,10 +4,10 @@ use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
-    extract_text_in_regions_mem, extract_text_with_positions, process_pdf_mem,
-    process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType,
-    TextItem,
+    detect_pdf_type, extract_pages_markdown, extract_pages_markdown_mem,
+    extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
+    extract_text_with_positions, process_pdf_mem, process_pdf_with_options, to_markdown,
+    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use std::collections::HashSet;
 
@@ -1481,7 +1481,7 @@ fn test_bits_pilani_page8_table_detection() {
 #[test]
 fn test_extract_pages_markdown_basic() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0, 1]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0, 1])).unwrap();
 
     assert_eq!(result.pages.len(), 2);
     assert_eq!(result.pages[0].page, 0);
@@ -1495,7 +1495,7 @@ fn test_extract_pages_markdown_basic() {
 fn test_extract_pages_markdown_page_ordering() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     // Request pages in non-sequential order
-    let result = extract_pages_markdown_mem(&buf, &[1, 0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[1, 0])).unwrap();
 
     assert_eq!(result.pages.len(), 2);
     // Results should match input order, not document order
@@ -1506,7 +1506,7 @@ fn test_extract_pages_markdown_page_ordering() {
 #[test]
 fn test_extract_pages_markdown_out_of_range() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[9999]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[9999])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
     assert_eq!(result.pages[0].page, 9999);
@@ -1518,14 +1518,14 @@ fn test_extract_pages_markdown_out_of_range() {
 #[test]
 fn test_extract_pages_markdown_empty_pages_list() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[])).unwrap();
     assert!(result.pages.is_empty());
 }
 
 #[test]
 fn test_extract_pages_markdown_single_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
     assert_eq!(result.pages[0].page, 0);
@@ -1535,7 +1535,7 @@ fn test_extract_pages_markdown_single_page() {
 
 #[test]
 fn test_extract_pages_markdown_invalid_buffer() {
-    let result = extract_pages_markdown_mem(b"not a pdf", &[0]);
+    let result = extract_pages_markdown_mem(b"not a pdf", Some(&[0]));
     assert!(result.is_err());
 }
 
@@ -1543,7 +1543,7 @@ fn test_extract_pages_markdown_invalid_buffer() {
 fn test_extract_pages_markdown_gid_pages_need_ocr() {
     // shinagawa_identity_h.pdf has GID-encoded fonts
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
     assert!(result.pages[0].needs_ocr);
@@ -1556,7 +1556,7 @@ fn test_extract_pages_markdown_classification_with_tables() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
     let page_count = process_pdf_mem(&buf).unwrap().page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&page_indices)).unwrap();
 
     assert!(
         !result.pages_with_tables.is_empty(),
@@ -1569,7 +1569,7 @@ fn test_extract_pages_markdown_classification_with_tables() {
 fn test_extract_pages_markdown_simple_pdf_no_complexity() {
     // bare_name_struct.pdf is a simple document with a heading and code block
     let buf = std::fs::read("tests/fixtures/bare_name_struct.pdf").unwrap();
-    let result = extract_pages_markdown_mem(&buf, &[0]).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert!(result.pages_with_tables.is_empty());
     assert!(result.pages_with_columns.is_empty());
@@ -1582,7 +1582,7 @@ fn test_extract_pages_markdown_classification_matches_process_pdf() {
     let full = process_pdf_mem(&buf).unwrap();
     let page_count = full.page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&page_indices)).unwrap();
 
     assert_eq!(
         result.pages_with_tables, full.layout.pages_with_tables,
@@ -1605,7 +1605,7 @@ fn test_extract_pages_markdown_consistency_with_process_pdf() {
     // Get per-page output for all pages
     let page_count = full.page_count;
     let page_indices: Vec<u32> = (0..page_count).collect();
-    let result = extract_pages_markdown_mem(&buf, &page_indices).unwrap();
+    let result = extract_pages_markdown_mem(&buf, Some(&page_indices)).unwrap();
 
     // Concatenated per-page markdown should contain substantial overlap with
     // the full output (exact match not expected due to header/footer stripping
@@ -1629,4 +1629,42 @@ fn test_extract_pages_markdown_consistency_with_process_pdf() {
         concat.len(),
         full_md.len()
     );
+}
+
+#[test]
+fn test_extract_pages_markdown_none_returns_all_pages() {
+    let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();
+    let page_count = process_pdf_mem(&buf).unwrap().page_count;
+
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert_eq!(result.pages.len() as u32, page_count);
+    for (i, page) in result.pages.iter().enumerate() {
+        assert_eq!(page.page, i as u32, "pages should be in document order");
+    }
+}
+
+#[test]
+fn test_extract_pages_markdown_path_api() {
+    let path = "tests/fixtures/nexo-price-en.pdf";
+    let buf = std::fs::read(path).unwrap();
+
+    let via_path = extract_pages_markdown(path, Some(&[0])).unwrap();
+    let via_mem = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
+
+    assert_eq!(via_path.pages.len(), via_mem.pages.len());
+    assert_eq!(via_path.pages[0].markdown, via_mem.pages[0].markdown);
+    assert_eq!(via_path.pages[0].needs_ocr, via_mem.pages[0].needs_ocr);
+    assert_eq!(via_path.is_complex, via_mem.is_complex);
+}
+
+#[test]
+fn test_extract_pages_markdown_path_none_returns_all_pages() {
+    let path = "tests/fixtures/nexo-price-en.pdf";
+    let page_count = process_pdf_mem(&std::fs::read(path).unwrap())
+        .unwrap()
+        .page_count;
+
+    let result = extract_pages_markdown(path, None).unwrap();
+    assert_eq!(result.pages.len() as u32, page_count);
 }

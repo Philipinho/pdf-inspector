@@ -343,21 +343,26 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
-/// Extract formatted markdown for specific pages of a PDF, with layout
-/// classification metadata.
+/// Extract formatted markdown for pages of a PDF, with layout classification
+/// metadata.
 ///
 /// Returns per-page markdown and classification data (tables, columns,
 /// OCR needs) from a single parse. Font statistics are computed from the
 /// full document so header detection is consistent across pages.
+///
+/// Omit `pages` (or pass `undefined`) to return every page in document
+/// order. Pass an array of 0-indexed page numbers to restrict output to
+/// those pages, in caller-supplied order.
 #[napi]
 pub fn extract_pages_markdown(
     buffer: Buffer,
-    pages: Vec<u32>,
+    pages: Option<Vec<u32>>,
 ) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
-        let result = pdf_inspector::extract_pages_markdown_mem(&bytes, &pages)
-            .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
+        let result =
+            pdf_inspector::extract_pages_markdown_mem(&bytes, pages.as_deref())
+                .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
         Ok(PagesExtractionResult {
             pages: result
                 .pages
