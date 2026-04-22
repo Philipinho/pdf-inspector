@@ -154,6 +154,12 @@ fn is_dots_only(cell: &str) -> bool {
     dots >= 3 && t.chars().all(|c| c == '.' || c.is_whitespace())
 }
 
+fn starts_with_uppercase_word(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphanumeric())
+        .is_some_and(|c| c.is_uppercase())
+}
+
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
 fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
@@ -212,11 +218,20 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
+        let uppercase_leading_cells = non_first_cells
+            .iter()
+            .filter(|cell| starts_with_uppercase_word(cell))
+            .count();
+        let looks_like_spanning_first_column_row = first_cell.is_empty()
+            && row.len() >= 4
+            && non_first_cells.len() == row.len().saturating_sub(1)
+            && uppercase_leading_cells >= non_first_cells.len().saturating_sub(1);
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
+            && !looks_like_spanning_first_column_row
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
@@ -246,6 +261,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && filled_cells <= max_filled_for_merge
             && prev_filled > filled_cells
             && !looks_like_data_row
+            && !looks_like_spanning_first_column_row
             && !is_short_subheader;
 
         let is_continuation = is_classic_continuation || is_wrapped_continuation;
@@ -413,6 +429,65 @@ mod tests {
         let (cleaned, _) = clean_table_cells(&cells);
         // Numeric data row with empty first col should not merge
         assert_eq!(cleaned.len(), 3);
+    }
+
+    #[test]
+    fn test_clean_table_cells_spanning_first_column_row_not_merged() {
+        let cells = vec![
+            vec![
+                "Category".into(),
+                "Potentially concerning aspect".into(),
+                "Summary".into(),
+                "Intervention".into(),
+            ],
+            vec![
+                "Identity & self-knowledge".into(),
+                "Lack of knowledge".into(),
+                "Overall negative".into(),
+                "Describe training".into(),
+            ],
+            vec![
+                "".into(),
+                "Uncertainty around other copies".into(),
+                "High uncertainty".into(),
+                "No intervention suggested".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 3);
+        assert_eq!(cleaned[2][0], "");
+        assert_eq!(cleaned[2][1], "Uncertainty around other copies");
+    }
+
+    #[test]
+    fn test_clean_table_cells_full_width_continuation_row_still_merges_when_lowercase() {
+        let cells = vec![
+            vec![
+                "Classification".into(),
+                "Before tax".into(),
+                "After tax".into(),
+                "Standard equipment".into(),
+                "Options".into(),
+            ],
+            vec![
+                "Exclusive Special".into(),
+                "83,500,000".into(),
+                "79,275,000".into(),
+                "Standard equipment".into(),
+                "Option A".into(),
+            ],
+            vec![
+                "".into(),
+                "with 3.5% individual consumption tax applied".into(),
+                "with 3.5% individual consumption tax applied".into(),
+                "lighting(crash pad)".into(),
+                "sound system".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 2);
+        assert!(cleaned[1][1].contains("83,500,000"));
+        assert!(cleaned[1][1].contains("with 3.5%"));
     }
 
     #[test]
