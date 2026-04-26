@@ -9,6 +9,7 @@ mod detect_struct;
 mod financial;
 mod format;
 mod grid;
+pub mod structured;
 
 pub use detect_heuristic::detect_tables;
 pub(crate) use detect_heuristic::is_table_of_contents;
@@ -17,6 +18,7 @@ pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
 pub use detect_struct::detect_tables_from_struct_tree;
 pub use format::table_to_markdown;
+pub use structured::{cells_to_markdown, StructuredCell};
 
 use crate::types::TextItem;
 

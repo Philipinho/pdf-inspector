@@ -317,6 +317,141 @@ pub fn extract_tables_in_regions(
     })
 }
 
+/// One cropped table region plus its raw structure-recovery output, for
+/// `extractTablesWithStructure`.
+///
+/// `structureTokens` and `cellBboxes` are typically produced by an external
+/// table-structure recognition model (e.g. SLANet on PaddleOCR) running on
+/// a rendered crop of the page. pdf-inspector uses the structure to lay out
+/// the cells and pulls the cell text from the native PDF — no OCR involved.
+#[napi(object)]
+pub struct TsrTableInputJs {
+    /// 0-indexed page number where the crop was taken from.
+    pub page: u32,
+    /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
+    /// top-left origin.
+    pub crop_pdf_pt_bbox: Vec<f64>,
+    /// DPI the crop image was rendered at (e.g. `200.0`).
+    pub render_dpi: f64,
+    /// Raw structure tokens emitted by the TSR model, in document order.
+    pub structure_tokens: Vec<String>,
+    /// One bbox per cell (in document order). May be 4-element
+    /// `[x1,y1,x2,y2]` or 8-element 4-corner polygon, in crop image-pixel
+    /// space.
+    pub cell_bboxes: Vec<Vec<f64>>,
+}
+
+/// Extract markdown tables using externally-supplied structure recovery.
+///
+/// For each input, pairs structure tokens with cell bboxes (rowspan/colspan
+/// aware), converts each cell bbox from crop image-pixels into page PDF
+/// points, pulls the cell's text from the native PDF, and emits a markdown
+/// pipe-table.
+///
+/// Returns one markdown string per input, in input order.
+#[napi]
+pub fn extract_tables_with_structure(
+    buffer: Buffer,
+    inputs: Vec<TsrTableInputJs>,
+) -> Result<Vec<String>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let parsed = parse_tsr_inputs(&inputs);
+
+    catch_panic("extract_tables_with_structure", move || {
+        pdf_inspector::extract_tables_with_structure_mem(&bytes, &parsed)
+            .map_err(|e| to_napi_err(e, "extract_tables_with_structure"))
+    })
+}
+
+/// One resolved cell from `extractTablesWithStructureCells`.
+#[napi(object)]
+pub struct StructuredCellJs {
+    /// 0-indexed grid row.
+    pub row: u32,
+    /// 0-indexed grid column.
+    pub col: u32,
+    /// 1 for a normal cell.
+    pub rowspan: u32,
+    /// 1 for a normal cell.
+    pub colspan: u32,
+    /// `true` when the cell is a `<th>` or sits inside `<thead>`.
+    pub is_header: bool,
+    /// Text extracted from the native PDF for this cell (may be empty).
+    pub text: String,
+    /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left
+    /// origin. Useful for debug overlays or per-cell post-processing.
+    pub page_pt_bbox: Vec<f64>,
+}
+
+/// Extract structured cells using externally-supplied structure recovery.
+///
+/// Lower-level sibling of [`extractTablesWithStructure`]: instead of
+/// rendering markdown, returns the resolved cells (row, col, rowspan,
+/// colspan, isHeader, text, pagePtBbox) so callers can drive their own
+/// rendering, debug overlays, or per-cell post-processing.
+///
+/// Returns one `Array<StructuredCellJs>` per input, in input order.
+#[napi]
+pub fn extract_tables_with_structure_cells(
+    buffer: Buffer,
+    inputs: Vec<TsrTableInputJs>,
+) -> Result<Vec<Vec<StructuredCellJs>>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let parsed = parse_tsr_inputs(&inputs);
+
+    catch_panic("extract_tables_with_structure_cells", move || {
+        let result = pdf_inspector::extract_tables_with_structure_cells_mem(&bytes, &parsed)
+            .map_err(|e| to_napi_err(e, "extract_tables_with_structure_cells"))?;
+        Ok(result
+            .into_iter()
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|c| StructuredCellJs {
+                        row: c.row as u32,
+                        col: c.col as u32,
+                        rowspan: c.rowspan as u32,
+                        colspan: c.colspan as u32,
+                        is_header: c.is_header,
+                        text: c.text,
+                        page_pt_bbox: c.page_pt_bbox.iter().map(|v| *v as f64).collect(),
+                    })
+                    .collect()
+            })
+            .collect())
+    })
+}
+
+fn parse_tsr_inputs(inputs: &[TsrTableInputJs]) -> Vec<pdf_inspector::TsrTableInput> {
+    inputs
+        .iter()
+        .map(|i| {
+            let crop = if i.crop_pdf_pt_bbox.len() == 4 {
+                [
+                    i.crop_pdf_pt_bbox[0] as f32,
+                    i.crop_pdf_pt_bbox[1] as f32,
+                    i.crop_pdf_pt_bbox[2] as f32,
+                    i.crop_pdf_pt_bbox[3] as f32,
+                ]
+            } else {
+                [0.0, 0.0, 0.0, 0.0]
+            };
+            let cell_bboxes: Vec<Vec<f32>> = i
+                .cell_bboxes
+                .iter()
+                .map(|bb| bb.iter().map(|v| *v as f32).collect())
+                .collect();
+            pdf_inspector::TsrTableInput {
+                page: i.page,
+                crop_pdf_pt_bbox: crop,
+                render_dpi: i.render_dpi as f32,
+                structure_tokens: i.structure_tokens.clone(),
+                cell_bboxes,
+            }
+        })
+        .collect()
+}
+
 /// Per-page markdown extraction result.
 #[napi(object)]
 pub struct PageMarkdownResult {
@@ -360,9 +495,8 @@ pub fn extract_pages_markdown(
 ) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
-        let result =
-            pdf_inspector::extract_pages_markdown_mem(&bytes, pages.as_deref())
-                .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
+        let result = pdf_inspector::extract_pages_markdown_mem(&bytes, pages.as_deref())
+            .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
         Ok(PagesExtractionResult {
             pages: result
                 .pages

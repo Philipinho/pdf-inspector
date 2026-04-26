@@ -784,6 +784,198 @@ pub fn extract_tables_in_regions_mem(
     Ok(results)
 }
 
+// =========================================================================
+// Region-based table extraction with external structure recovery (TSR)
+// =========================================================================
+
+/// Input for [`extract_tables_with_structure_mem`]: one cropped table region
+/// plus the raw structure-recovery output for it.
+///
+/// The structure tokens and bboxes are typically produced by an external
+/// table-structure recognition model (e.g. SLANet on PaddleOCR) running on
+/// a rendered crop of the page. pdf-inspector uses the structure to lay out
+/// the cells and pulls the cell text from the native PDF — no OCR involved.
+#[derive(Debug, Clone)]
+pub struct TsrTableInput {
+    /// 0-indexed page number where the crop was taken from.
+    pub page: u32,
+    /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
+    /// **top-left origin** (matches the layout model's coordinate space).
+    pub crop_pdf_pt_bbox: [f32; 4],
+    /// DPI the crop image was rendered at (e.g. `200.0`). Used to convert
+    /// cell bboxes from image-pixels back to PDF points.
+    pub render_dpi: f32,
+    /// Raw structure tokens emitted by the TSR model, in document order.
+    /// See [`tables::structured::parse_structure`] for the accepted grammar.
+    pub structure_tokens: Vec<String>,
+    /// One bbox per cell (in document order, parallel to the cell open-tags
+    /// in `structure_tokens`). May be 4-element `[x1,y1,x2,y2]` or
+    /// 8-element 4-corner polygon, in **crop image-pixel space**.
+    pub cell_bboxes: Vec<Vec<f32>>,
+}
+
+/// Extract structured cells using externally-supplied structure recovery.
+///
+/// For each input, this:
+/// 1. Pairs each cell open-tag in `structure_tokens` with the next bbox in
+///    `cell_bboxes` (document order), tracking row/col with rowspan/colspan
+///    awareness.
+/// 2. Converts each cell bbox from crop image-pixels into page PDF-points.
+/// 3. Pulls the cell's text by overlap-testing PDF text items inside that
+///    bbox — same primitives used by [`extract_text_in_regions_mem`].
+///
+/// Returns one `Vec<StructuredCell>` per input, in input order. Each cell
+/// carries its (row, col, rowspan, colspan, is_header) metadata, the
+/// extracted text, and its page-PDF-pt bbox so callers can do their own
+/// rendering, debug overlays, or per-cell post-processing.
+///
+/// Inputs whose page is out of range or whose tokens parse to zero cells
+/// produce an empty `Vec`.
+///
+/// See [`extract_tables_with_structure_mem`] if you just want the rendered
+/// markdown.
+pub fn extract_tables_with_structure_cells_mem(
+    buffer: &[u8],
+    inputs: &[TsrTableInput],
+) -> Result<Vec<Vec<tables::StructuredCell>>, PdfError> {
+    use tables::structured::{
+        cell_px_to_page_pt, parse_structure, polygon_to_aabb, StructuredCell,
+    };
+
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let pages = doc.get_pages();
+
+    let needed_pages: HashSet<u32> = inputs.iter().map(|t| t.page + 1).collect();
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
+
+    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut page_heights: HashMap<u32, f32> = HashMap::new();
+    let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
+    let mut rotated_pages: HashSet<u32> = HashSet::new();
+
+    for (page_num, &page_id) in pages.iter() {
+        if !needed_pages.contains(page_num) {
+            continue;
+        }
+        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
+        page_heights.insert(*page_num, height);
+
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+            extractor::content_stream::extract_page_text_items(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                false,
+            )?;
+        let threshold = text_utils::fix_letterspaced_items(&mut items);
+        if threshold > 0.10 {
+            page_thresholds.insert(*page_num, threshold);
+        }
+        if coords_rotated {
+            rotated_pages.insert(*page_num);
+        }
+        items_by_page.insert(*page_num, items);
+    }
+
+    let mut results: Vec<Vec<StructuredCell>> = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let page_1idx = input.page + 1;
+        let Some(items) = items_by_page.get(&page_1idx) else {
+            // Out-of-range page or page with no extractable text — emit empty.
+            results.push(Vec::new());
+            continue;
+        };
+        let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
+        let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
+        let coords = if rotated_pages.contains(&page_1idx) {
+            RegionCoordSpace::Rotated90Ccw
+        } else {
+            RegionCoordSpace::Standard
+        };
+
+        let crop_origin = [input.crop_pdf_pt_bbox[0], input.crop_pdf_pt_bbox[1]];
+
+        let slots = parse_structure(&input.structure_tokens);
+        if slots.is_empty() {
+            results.push(Vec::new());
+            continue;
+        }
+
+        let mut cells: Vec<StructuredCell> = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let cell_text;
+            let page_pt_bbox;
+
+            if let Some(coords_arr) = input.cell_bboxes.get(slot.bbox_idx) {
+                if let Some(aabb_px) = polygon_to_aabb(coords_arr) {
+                    let aabb_pt = cell_px_to_page_pt(aabb_px, input.render_dpi, crop_origin);
+                    let raw = collect_text_in_region_with_options(
+                        items,
+                        aabb_pt[0],
+                        aabb_pt[1],
+                        aabb_pt[2],
+                        aabb_pt[3],
+                        page_h,
+                        coords,
+                        adaptive_threshold,
+                    );
+                    // Markdown cells must be one line — collapse line breaks
+                    // produced by the line-grouping pass.
+                    cell_text = raw.replace(['\n', '\r'], " ");
+                    page_pt_bbox = aabb_pt;
+                } else {
+                    cell_text = String::new();
+                    page_pt_bbox = [0.0, 0.0, 0.0, 0.0];
+                }
+            } else {
+                cell_text = String::new();
+                page_pt_bbox = [0.0, 0.0, 0.0, 0.0];
+            }
+
+            cells.push(StructuredCell {
+                row: slot.row,
+                col: slot.col,
+                rowspan: slot.rowspan,
+                colspan: slot.colspan,
+                is_header: slot.is_header,
+                text: cell_text,
+                page_pt_bbox,
+            });
+        }
+
+        results.push(cells);
+    }
+
+    Ok(results)
+}
+
+/// Extract markdown tables using externally-supplied structure recovery.
+///
+/// Convenience wrapper around [`extract_tables_with_structure_cells_mem`]
+/// that renders each cell list to markdown via
+/// [`tables::cells_to_markdown`]. Returns one markdown string per input,
+/// in input order. Inputs whose page is out of range or whose tokens parse
+/// to zero cells produce an empty string.
+pub fn extract_tables_with_structure_mem(
+    buffer: &[u8],
+    inputs: &[TsrTableInput],
+) -> Result<Vec<String>, PdfError> {
+    let cells_lists = extract_tables_with_structure_cells_mem(buffer, inputs)?;
+    Ok(cells_lists
+        .into_iter()
+        .map(|cells| {
+            if cells.is_empty() {
+                String::new()
+            } else {
+                tables::cells_to_markdown(&cells)
+            }
+        })
+        .collect())
+}
+
 /// Get page height in points from MediaBox.
 fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
     let page_dict = doc.get_dictionary(page_id).ok()?;

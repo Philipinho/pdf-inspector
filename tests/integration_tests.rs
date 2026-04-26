@@ -1475,6 +1475,306 @@ fn test_bits_pilani_page8_table_detection() {
 }
 
 // =========================================================================
+// extract_tables_with_structure_mem tests (TSR-aware path)
+// =========================================================================
+
+/// Build an 8-element 4-corner polygon `[x1,y1, x2,y1, x2,y2, x1,y2]` from
+/// an axis-aligned rect — matches the format SLANet emits for cell bboxes.
+fn poly(x1: f32, y1: f32, x2: f32, y2: f32) -> Vec<f32> {
+    vec![x1, y1, x2, y1, x2, y2, x1, y2]
+}
+
+#[test]
+fn test_extract_tables_with_structure_real_pdf_bits_pilani() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    // Hand-crafted TSR fixture targeting page 4 (0-indexed=3) of
+    // bits_pilani_feedback.pdf, which contains a clean tabular layout.
+    //
+    // We construct a 2×2 table:
+    //   row 0 (header): "Department"   "Core Courses"
+    //   row 1 (data):   "BIO"          "8.23"
+    //
+    // The PDF page is US Letter (792pt tall). We render at 72 dpi so
+    // image-px maps 1:1 to PDF-pt — that lets us write cell bboxes in
+    // the same units as our hand-measured page-pt coordinates.
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    // The PDF page is A4 in points (≈595.44 × 841.68). The table sits in
+    // the upper part of the page; we crop a window large enough to enclose
+    // both rows we care about.
+    //
+    // Crop bounds in PDF points (top-left origin):
+    //   x: 80..280, y: 170..240
+    let crop = [80.0_f32, 170.0, 280.0, 240.0];
+    let dpi = 72.0_f32;
+
+    // Cell bboxes in CROP image-pixel space (= crop-relative PDF-pt at
+    // 72 dpi). The y ranges are tightened against neighbouring rows
+    // ("First Degree" above the header at native y=666.7, "Feedback Score"
+    // between the header and data rows at native y=640.9, "CE" below the
+    // BIO row at native y=591.1) so each cell only overlaps its target
+    // text item.
+    let cell_bboxes = vec![
+        // Header row: y crop-relative (7, 18) → page-pt y (177, 188)
+        poly(10.0, 7.0, 100.0, 18.0), // "Department"   (item at page-pt x=107.1)
+        poly(110.0, 7.0, 200.0, 18.0), // "Core Courses" (item at page-pt x=199.0)
+        // Data row: y crop-relative (35, 60) → page-pt y (205, 230)
+        poly(10.0, 35.0, 100.0, 60.0), // "BIO"  (item at page-pt x=104.1)
+        poly(110.0, 35.0, 200.0, 60.0), // "8.23" (item at page-pt x=221.2)
+    ];
+
+    // Minimal SLANet-style token stream: a 2-row table with a thead and tbody.
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let inputs = vec![TsrTableInput {
+        page: 3,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: dpi,
+        structure_tokens: tokens,
+        cell_bboxes,
+    }];
+
+    let mds = extract_tables_with_structure_mem(&buf, &inputs).unwrap();
+    assert_eq!(mds.len(), 1);
+    let md = &mds[0];
+
+    // Hand-written gold standard for the rendered markdown.
+    let expected = "|Department|Core Courses|\n|---|---|\n|BIO|8.23|\n";
+    assert_eq!(
+        md, expected,
+        "structured-table markdown should match the gold standard exactly\nactual: {md}"
+    );
+}
+
+#[test]
+fn test_extract_tables_with_structure_input_order_preserved() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    // Two inputs; both target the same page but with different shapes.
+    // We just need to confirm we get 2 outputs in the same order.
+    let make_input = |toks: Vec<&str>, cells: Vec<Vec<f32>>| TsrTableInput {
+        page: 3,
+        crop_pdf_pt_bbox: [80.0, 170.0, 280.0, 240.0],
+        render_dpi: 72.0,
+        structure_tokens: toks.into_iter().map(String::from).collect(),
+        cell_bboxes: cells,
+    };
+
+    let inputs = vec![
+        make_input(
+            vec!["<table>", "<tr>", "<td></td>", "</tr>", "</table>"],
+            vec![poly(10.0, 35.0, 100.0, 60.0)],
+        ),
+        make_input(
+            vec!["<table>", "<tr>", "<td></td>", "</tr>", "</table>"],
+            vec![poly(110.0, 35.0, 200.0, 60.0)],
+        ),
+    ];
+
+    let mds = extract_tables_with_structure_mem(&buf, &inputs).unwrap();
+    assert_eq!(mds.len(), 2);
+    assert!(
+        mds[0].contains("BIO"),
+        "input 0 should pull 'BIO': {}",
+        mds[0]
+    );
+    assert!(
+        mds[1].contains("8.23"),
+        "input 1 should pull '8.23': {}",
+        mds[1]
+    );
+}
+
+#[test]
+fn test_extract_tables_with_structure_out_of_range_page() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    let inputs = vec![TsrTableInput {
+        page: 9999,
+        crop_pdf_pt_bbox: [0.0, 0.0, 100.0, 100.0],
+        render_dpi: 72.0,
+        structure_tokens: vec![
+            "<table>".into(),
+            "<tr>".into(),
+            "<td></td>".into(),
+            "</tr>".into(),
+            "</table>".into(),
+        ],
+        cell_bboxes: vec![poly(0.0, 0.0, 50.0, 50.0)],
+    }];
+
+    let mds = extract_tables_with_structure_mem(&buf, &inputs).unwrap();
+    assert_eq!(mds.len(), 1);
+    assert!(
+        mds[0].is_empty(),
+        "out-of-range page should yield empty string"
+    );
+}
+
+#[test]
+fn test_extract_tables_with_structure_not_a_pdf() {
+    use pdf_inspector::extract_tables_with_structure_mem;
+    let result = extract_tables_with_structure_mem(b"not a pdf", &[]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_extract_tables_with_structure_empty_inputs() {
+    use pdf_inspector::extract_tables_with_structure_mem;
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+    let mds = extract_tables_with_structure_mem(&buf, &[]).unwrap();
+    assert!(mds.is_empty());
+}
+
+#[test]
+fn test_extract_tables_with_structure_cells_real_pdf_bits_pilani() {
+    use pdf_inspector::{extract_tables_with_structure_cells_mem, TsrTableInput};
+    // Same fixture as test_extract_tables_with_structure_real_pdf_bits_pilani
+    // but exercising the cell-level API. Verifies that callers receive
+    // structured per-cell metadata (row/col/spans/is_header/page_pt_bbox)
+    // alongside the extracted text.
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    let crop = [80.0_f32, 170.0, 280.0, 240.0];
+    let dpi = 72.0_f32;
+    let cell_bboxes = vec![
+        poly(10.0, 7.0, 100.0, 18.0),
+        poly(110.0, 7.0, 200.0, 18.0),
+        poly(10.0, 35.0, 100.0, 60.0),
+        poly(110.0, 35.0, 200.0, 60.0),
+    ];
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let inputs = vec![TsrTableInput {
+        page: 3,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: dpi,
+        structure_tokens: tokens,
+        cell_bboxes,
+    }];
+
+    let cells_lists = extract_tables_with_structure_cells_mem(&buf, &inputs).unwrap();
+    assert_eq!(cells_lists.len(), 1);
+    let cells = &cells_lists[0];
+    assert_eq!(cells.len(), 4);
+
+    // Header row: both cells flagged as headers (they were in <thead>/<th>).
+    assert!(cells[0].is_header);
+    assert!(cells[1].is_header);
+    assert_eq!((cells[0].row, cells[0].col), (0, 0));
+    assert_eq!((cells[1].row, cells[1].col), (0, 1));
+    assert_eq!(cells[0].text, "Department");
+    assert_eq!(cells[1].text, "Core Courses");
+
+    // Data row: not flagged as header.
+    assert!(!cells[2].is_header);
+    assert!(!cells[3].is_header);
+    assert_eq!((cells[2].row, cells[2].col), (1, 0));
+    assert_eq!((cells[3].row, cells[3].col), (1, 1));
+    assert_eq!(cells[2].text, "BIO");
+    assert_eq!(cells[3].text, "8.23");
+
+    // Every cell carries a non-degenerate page-pt bbox.
+    for c in cells {
+        let [x1, y1, x2, y2] = c.page_pt_bbox;
+        assert!(
+            x1 < x2 && y1 < y2,
+            "cell bbox should be non-empty: {:?}",
+            c.page_pt_bbox
+        );
+    }
+}
+
+#[test]
+fn test_extract_tables_with_structure_separator_after_thead() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+    // Re-run the same 2x2 fixture but assert exact markdown output: with
+    // <thead> + <th> headers, the separator should land after the header
+    // row (which is also row 0 here, so the gold-standard hasn't changed).
+    let buf = std::fs::read("tests/fixtures/bits_pilani_feedback.pdf").unwrap();
+
+    let crop = [80.0_f32, 170.0, 280.0, 240.0];
+    let dpi = 72.0_f32;
+    let cell_bboxes = vec![
+        poly(10.0, 7.0, 100.0, 18.0),
+        poly(110.0, 7.0, 200.0, 18.0),
+        poly(10.0, 35.0, 100.0, 60.0),
+        poly(110.0, 35.0, 200.0, 60.0),
+    ];
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let mds = extract_tables_with_structure_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 3,
+            crop_pdf_pt_bbox: crop,
+            render_dpi: dpi,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(mds.len(), 1);
+    assert_eq!(mds[0], "|Department|Core Courses|\n|---|---|\n|BIO|8.23|\n");
+}
+
+// =========================================================================
 // extract_pages_markdown_mem tests
 // =========================================================================
 
