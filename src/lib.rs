@@ -1032,6 +1032,13 @@ fn tsr_assign_orphan_items(
     if cap_x <= 0.0 || cap_y <= 0.0 {
         return;
     }
+    // Y-tolerance for "same line as a previous orphan" — multi-token branch
+    // names like "Blue Valley Parkway" are 3 separate text items and should
+    // all stack into the same cell. But two orphans on different rows of
+    // the PDF (different y values) targeting the same empty cell should
+    // NOT merge — that produces the "Mitchell Woonsocket" / "Shawnee Blue
+    // Valley Parkway" run-on cells. Half a row of slack is conservative.
+    let y_tolerance = (cap_y * 0.5).max(3.0);
 
     // Pre-compute each empty cell's region bounds so we don't re-flip
     // page coordinates per orphan-candidate pair.
@@ -1049,6 +1056,11 @@ fn tsr_assign_orphan_items(
         })
         .collect();
 
+    // Track the y-center of the FIRST orphan that landed in each cell so
+    // subsequent orphans only stack if they're on the same line.
+    let mut stage2_first_y: std::collections::HashMap<usize, f32> =
+        std::collections::HashMap::new();
+
     for (i, item) in items.iter().enumerate() {
         if claimed.contains(&i) {
             continue;
@@ -1065,6 +1077,14 @@ fn tsr_assign_orphan_items(
             let Some(bounds) = bounds_opt else {
                 continue;
             };
+            // If a previous orphan already landed in this cell, only let a
+            // new orphan join if it's on the same line. Cross-line orphans
+            // need to look elsewhere (next-nearest empty cell).
+            if let Some(&first_y) = stage2_first_y.get(&ci) {
+                if (first_y - cy).abs() > y_tolerance {
+                    continue;
+                }
+            }
             let dx = (bounds.x_min - cx).max(0.0).max(cx - bounds.x_max);
             let dy = (bounds.y_min - cy).max(0.0).max(cy - bounds.y_max);
             if dx > cap_x || dy > cap_y {
@@ -1077,10 +1097,9 @@ fn tsr_assign_orphan_items(
         }
 
         if let Some((ci, _)) = best {
-            // Append, preserving stage 1's content if (rarely) another
-            // orphan in this same pass already filled the cell. Each
-            // orphan contributes its raw text — single-token items don't
-            // need the line-grouping pass that stage 1 uses.
+            // Append, preserving stage 1's content. Same-line orphans
+            // stack to support multi-token text (e.g. "Blue Valley
+            // Parkway"); cross-line orphans are filtered out above.
             let trimmed = item.text.trim();
             if cells[ci].text.is_empty() {
                 cells[ci].text = trimmed.to_string();
@@ -1088,6 +1107,7 @@ fn tsr_assign_orphan_items(
                 cells[ci].text.push(' ');
                 cells[ci].text.push_str(trimmed);
             }
+            stage2_first_y.entry(ci).or_insert(cy);
         }
     }
 }
@@ -2833,6 +2853,101 @@ mod tests {
         assert_eq!(cells[0].text, "Bellevue");
         assert_eq!(cells[1].text, "Glenwood");
         assert_eq!(cells[2].text, "Metro Crossing");
+    }
+
+    #[test]
+    fn stage2_rejects_cross_line_stacking_into_same_cell() {
+        // Two orphans on different rows of the PDF, both equidistant from
+        // the same empty cell. Without the same-line guard they'd both stack
+        // into that cell ("Shawnee Blue Valley Parkway" run-on); the guard
+        // keeps the first orphan and routes the second to the next-nearest
+        // empty cell on its own line.
+        use crate::tables::StructuredCell;
+        // page_h=200. Two empty cells:
+        //   cell X (row 0): top-left y=[100, 110], native [90, 100]
+        //   cell Y (row 1): top-left y=[112, 122], native [78, 88]
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 100.0, 100.0, 110.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 112.0, 100.0, 122.0],
+            },
+        ];
+        // Two orphans, different rows of the PDF (y differs by 14pt = a
+        // full row), both 2pt outside their target cell — both within
+        // cap_y, both equidistant-ish to cell X. Without the same-line
+        // guard they'd both land in X.
+        //   "Shawnee" should belong to cell X (row 0) — center y=98 is
+        //   2pt below X's native min=100.
+        //   "BlueValley" should belong to cell Y (row 1) — center y=84
+        //   is 4pt above Y's native max=88.
+        let items = vec![
+            // Shawnee orphan — closer to X (dy=2) than Y (dy=6 from native min=78).
+            test_item("Shawnee", 30.0, 94.0, 50.0, 8.0),
+            // BlueValley orphan — closer to Y (dy=4) than X (dy=8 from native max=100).
+            test_item("BlueValley", 30.0, 80.0, 60.0, 8.0),
+        ];
+        let claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            200.0,
+            RegionCoordSpace::Standard,
+        );
+        assert_eq!(cells[0].text, "Shawnee");
+        assert_eq!(cells[1].text, "BlueValley");
+        assert!(!cells[0].text.contains("BlueValley"));
+        assert!(!cells[1].text.contains("Shawnee"));
+    }
+
+    #[test]
+    fn stage2_allows_same_line_orphans_to_stack_into_one_cell() {
+        // Multi-token branch names like "Blue Valley Parkway" are 3 PDF
+        // text items at the SAME y-coordinate. They should all stack into
+        // the cell their row's branch-name belongs to, not get split
+        // across rows by the cross-line guard.
+        use crate::tables::StructuredCell;
+        let mut cells = vec![StructuredCell {
+            row: 0,
+            col: 0,
+            rowspan: 1,
+            colspan: 1,
+            is_header: false,
+            text: String::new(),
+            page_pt_bbox: [10.0, 100.0, 200.0, 110.0],
+        }];
+        // Three same-line items, all 2pt below the cell's native bottom.
+        let items = vec![
+            test_item("Blue", 30.0, 94.0, 25.0, 8.0),
+            test_item("Valley", 60.0, 94.0, 35.0, 8.0),
+            test_item("Parkway", 100.0, 94.0, 45.0, 8.0),
+        ];
+        let claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            200.0,
+            RegionCoordSpace::Standard,
+        );
+        // All three same-line orphans stacked into the single empty cell.
+        assert_eq!(cells[0].text, "Blue Valley Parkway");
     }
 
     #[test]
