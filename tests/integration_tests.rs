@@ -2190,6 +2190,219 @@ fn test_auto_returns_empty_inputs() {
     assert!(results.is_empty());
 }
 
+#[test]
+fn test_auto_does_not_fire_on_legit_rowspan_cell() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    // 2 columns, 3 rows in the visible PDF. SLANet emits a 2-row table
+    // where the LEFT cell of row 1 is a rowspan=2 cell that legitimately
+    // covers Oak Street + Boardwalk on two visual lines. The right
+    // column has two normal rows. multi_row_in_cell must NOT fire on
+    // the rowspan=2 cell.
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        // First data cell explicitly declares rowspan=2.
+        "<td",
+        " rowspan=\"2\"",
+        ">",
+        "</td>",
+        "<td></td>",
+        "</tr>",
+        "<tr>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Header row, then a tall left cell covering both data lines, plus
+    // two narrow right cells (one per line).
+    let cell_bboxes = vec![
+        poly(10.0, 88.0, 100.0, 105.0),
+        poly(90.0, 88.0, 180.0, 105.0),
+        poly(10.0, 105.0, 100.0, 145.0), // rowspan=2 — covers both lines
+        poly(90.0, 105.0, 180.0, 122.0), // row 1 only
+        poly(90.0, 122.0, 180.0, 145.0), // row 2 only
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].fallback_reason.is_none(),
+        "rowspan=2 cell containing 2 visual lines should not trip multi_row_in_cell, got reason={:?}",
+        results[0].fallback_reason,
+    );
+}
+
+#[test]
+fn test_auto_keeps_tsr_markdown_when_heuristic_returns_empty() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    // Same shape as the multi_row_in_cell regression — a tall data cell
+    // that catches Oak Street + Boardwalk. But the crop bbox we pass
+    // points at a strip of the page that has NO text items, so the
+    // heuristic's region will be empty when it tries to extract there.
+    // The auto wrapper must keep the TSR markdown rather than ship "".
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Cell bboxes overlap the actual PDF text (so multi_row_in_cell
+    // fires) — but the crop_pdf_pt_bbox we hand to the heuristic is a
+    // wholly-empty region of the page. The heuristic should return "".
+    let cell_bboxes = vec![
+        poly(10.0, 88.0, 100.0, 105.0),
+        poly(90.0, 88.0, 180.0, 105.0),
+        poly(10.0, 105.0, 100.0, 145.0),
+        poly(90.0, 105.0, 180.0, 145.0),
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            // Crop is at the BOTTOM of the page where there's no text.
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 50.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert_eq!(
+        r.fallback_reason.as_deref(),
+        Some("multi_row_in_cell_heuristic_empty"),
+        "expected _heuristic_empty suffix, got {:?}",
+        r.fallback_reason,
+    );
+    // TSR markdown should be preserved — non-empty, contains the cell
+    // text we know was assigned by the TSR path.
+    assert!(
+        !r.markdown.trim().is_empty(),
+        "expected TSR markdown to be preserved, got empty",
+    );
+    assert!(
+        r.markdown.contains("Oak Street") || r.markdown.contains("Boardwalk"),
+        "expected TSR markdown to contain at least one row, got: {}",
+        r.markdown,
+    );
+}
+
+#[test]
+fn test_auto_isolates_per_input_failures() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    let good_tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // A clean input that should pass through with no fallback.
+    let good_input = TsrTableInput {
+        page: 0,
+        crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+        render_dpi: 72.0,
+        structure_tokens: good_tokens,
+        cell_bboxes: vec![
+            poly(10.0, 72.0, 100.0, 112.0),
+            poly(90.0, 72.0, 180.0, 112.0),
+            poly(10.0, 88.8, 100.0, 128.8),
+            poly(90.0, 88.8, 180.0, 128.8),
+            poly(10.0, 105.6, 100.0, 145.6),
+            poly(90.0, 105.6, 180.0, 145.6),
+        ],
+    };
+    // A bad input that targets a non-existent page. The detection
+    // helper short-circuits on missing pages with Ok(None), so this
+    // shouldn't itself crash, but pairing it with a flagged input
+    // exercises the per-input control flow regardless. The point of
+    // this test is that one input's outcome doesn't poison the other.
+    let bad_input = TsrTableInput {
+        page: 9999,
+        crop_pdf_pt_bbox: [0.0, 0.0, 100.0, 100.0],
+        render_dpi: 72.0,
+        structure_tokens: vec![
+            "<table>".into(),
+            "<tr>".into(),
+            "<td></td>".into(),
+            "</tr>".into(),
+            "</table>".into(),
+        ],
+        cell_bboxes: vec![poly(0.0, 0.0, 50.0, 50.0)],
+    };
+
+    let results = extract_tables_with_structure_auto_mem(&buf, &[good_input, bad_input]).unwrap();
+    assert_eq!(results.len(), 2);
+    // Good input still produces non-empty TSR markdown with no fallback.
+    assert!(
+        results[0].fallback_reason.is_none(),
+        "good input should pass through, got reason={:?}",
+        results[0].fallback_reason,
+    );
+    assert!(results[0].markdown.contains("Oak Street"));
+    // Bad input collapses to empty markdown but doesn't take the
+    // batch down with it.
+    assert_eq!(results[1].markdown, "");
+}
+
 // =========================================================================
 // extract_pages_markdown_mem tests
 // =========================================================================

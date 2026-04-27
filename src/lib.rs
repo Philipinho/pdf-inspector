@@ -1208,11 +1208,13 @@ pub struct TableExtractionResult {
 /// * `phantom_empty_row` — a row whose every cell is empty, surrounded
 ///   above and below by rows with content. SLANet sometimes emits an
 ///   extra row that doesn't correspond to any visible PDF row.
-/// * `multi_row_in_cell` — at least one cell's matched PDF text items
-///   span more than 1.3× either the smallest cell height or the tallest
-///   contained item's own height, meaning the cell has absorbed text
-///   from two adjacent visual rows. SLANet's row under-detection on
-///   tightly-packed tables produces this.
+/// * `multi_row_in_cell` — at least one `rowspan==1` cell encloses
+///   PDF text items that cluster into two distinct visual lines
+///   separated by a whitespace gap larger than the line height. Cells
+///   declared as `rowspan>1` are excluded since they are *expected*
+///   to span multiple lines. SLANet's row under-detection on
+///   tightly-packed tables produces the rowspan==1-but-multi-line
+///   pattern (the FNBO failure mode).
 fn detect_tsr_quality_issue(
     buffer: &[u8],
     input: &TsrTableInput,
@@ -1238,10 +1240,12 @@ fn detect_tsr_quality_issue(
         }
     }
 
-    // Multi-row-in-cell: re-extract PDF text items in the page and check
-    // whether any non-empty cell's bbox encloses items whose y-centers
-    // span across multiple visual lines. This is the FNBO failure mode —
-    // a tall TSR cell catches text from two adjacent PDF rows.
+    // Multi-row-in-cell: re-extract PDF text items in the page and look
+    // for `rowspan==1` cells that contain items grouped into ≥2 visual
+    // lines separated by a real whitespace gap. This is the FNBO mode:
+    // a tall TSR cell catches text from two adjacent PDF rows that
+    // SLANet failed to separate. Cells declared `rowspan>1` are
+    // expected to be multi-line and are excluded.
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
     let page_1idx = input.page + 1;
@@ -1267,20 +1271,11 @@ fn detect_tsr_quality_issue(
         RegionCoordSpace::Standard
     };
 
-    // Use the minimum non-empty cell height as the typical-row baseline.
-    // The pathology is that some cells are abnormally tall (multi-row),
-    // so taking the median or mean would scale with the bad cells. The
-    // smallest cell is likely a tightly-bound single-row cell, which is
-    // a better proxy for a real row's height.
-    let mut heights: Vec<f32> = cells
-        .iter()
-        .map(|c| (c.page_pt_bbox[3] - c.page_pt_bbox[1]).abs())
-        .filter(|h| *h > 0.0)
-        .collect();
-    heights.sort_by(|a, b| a.total_cmp(b));
-    let typical_row_h = heights.first().copied().unwrap_or(15.0).max(5.0);
-
     for cell in cells {
+        // rowspan>1 cells are intentionally multi-line — skip them.
+        if cell.rowspan > 1 {
+            continue;
+        }
         if cell.text.trim().is_empty() {
             continue;
         }
@@ -1289,31 +1284,51 @@ fn detect_tsr_quality_issue(
             continue;
         }
         let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
-        let mut min_y = f32::INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        let mut max_item_h = 0f32;
-        let mut count = 0u32;
+
+        // Collect the items inside this cell, with their y-centers and
+        // half-heights so we can cluster them into visual lines.
+        let mut cell_items: Vec<(f32, f32)> = Vec::new();
         for item in &items {
             if tsr_region_contains_item(item, bounds) {
                 let cy = item.y + item.height * 0.5;
-                min_y = min_y.min(cy);
-                max_y = max_y.max(cy);
-                max_item_h = max_item_h.max(item.height);
-                count += 1;
+                let half_h = (item.height * 0.5).max(2.5);
+                cell_items.push((cy, half_h));
             }
         }
-        if count < 2 {
+        if cell_items.len() < 2 {
             continue;
         }
-        // Items on the same visual line have y-centers within ~one
-        // line-height. Flag a cell whose items span > 1.3× both the
-        // typical row height AND the largest item's own height —
-        // either signal alone is a strong indicator of multi-line text
-        // inside a cell that should be a single row.
-        let span = max_y - min_y;
-        let row_threshold = typical_row_h * 1.3;
-        let item_threshold = max_item_h.max(5.0) * 1.3;
-        if span > row_threshold || span > item_threshold {
+        // Sort by y-center descending (top-of-page first in PDF native
+        // coords where y grows upward) — direction doesn't matter, we
+        // just need consecutive items to be neighbors in the sort.
+        cell_items.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        // Walk pairs and see if there's a real whitespace gap between
+        // any two adjacent items — defined as their bounding-box edges
+        // separated by more than half a line height. This rules out
+        // tall glyphs / superscripts / accents on a single visual line.
+        let max_half_h = cell_items
+            .iter()
+            .map(|(_, h)| *h)
+            .fold(0f32, f32::max)
+            .max(2.5);
+        let gap_threshold = max_half_h; // ≈ half a line height
+        let mut found_gap = false;
+        for w in cell_items.windows(2) {
+            let (cy_a, h_a) = w[0];
+            let (cy_b, h_b) = w[1];
+            // Gap = distance between the bottom of the upper item and
+            // the top of the lower item, measured in PDF-native coords
+            // (y grows upward, so the upper item has the larger cy).
+            let upper_bottom = cy_a - h_a;
+            let lower_top = cy_b + h_b;
+            let gap = upper_bottom - lower_top;
+            if gap > gap_threshold {
+                found_gap = true;
+                break;
+            }
+        }
+        if found_gap {
             return Ok(Some("multi_row_in_cell".to_string()));
         }
     }
@@ -1331,6 +1346,20 @@ fn detect_tsr_quality_issue(
 /// On flagged inputs the heuristic markdown replaces the TSR markdown
 /// and the result's `fallback_reason` is set to the diagnostic label.
 ///
+/// Two failure modes are guarded against per-input:
+///
+/// * **Empty heuristic**: if the heuristic returns empty/whitespace
+///   markdown for a flagged region, the original TSR markdown is
+///   preserved and `fallback_reason` is suffixed with
+///   `_heuristic_empty` (e.g. `multi_row_in_cell_heuristic_empty`).
+///   This avoids replacing a usable wrong-but-non-empty TSR output
+///   with literally nothing.
+/// * **Per-input errors**: any failure in detection or heuristic
+///   extraction for a single input is contained — that input
+///   returns the raw TSR markdown with `fallback_reason` set to
+///   an `_error` label so callers can metric on it. Other inputs
+///   in the same batch are unaffected.
+///
 /// Use this from production callers that want self-healing output.
 /// Use [`extract_tables_with_structure_mem`] when you want raw TSR
 /// output regardless of quality (e.g. eval harnesses comparing the
@@ -1344,32 +1373,65 @@ pub fn extract_tables_with_structure_auto_mem(
 
     for (i, input) in inputs.iter().enumerate() {
         let cells = &tsr_cells[i];
-        let issue = detect_tsr_quality_issue(buffer, input, cells)?;
+        let tsr_md = if cells.is_empty() {
+            String::new()
+        } else {
+            tables::cells_to_markdown(cells)
+        };
+
+        let issue = match detect_tsr_quality_issue(buffer, input, cells) {
+            Ok(opt) => opt,
+            Err(_) => {
+                // Detection failed for this input — fall through with
+                // the raw TSR markdown so the rest of the batch is
+                // unaffected. Tag the reason for caller metrics.
+                results.push(TableExtractionResult {
+                    markdown: tsr_md,
+                    fallback_reason: Some("detection_error".to_string()),
+                });
+                continue;
+            }
+        };
 
         let result = match issue {
             None => TableExtractionResult {
-                markdown: if cells.is_empty() {
-                    String::new()
-                } else {
-                    tables::cells_to_markdown(cells)
-                },
+                markdown: tsr_md,
                 fallback_reason: None,
             },
             Some(reason) => {
                 // Fall back to heuristic on the input's table region.
                 // The crop's PDF-pt bbox IS the table region.
-                let heuristic = extract_tables_in_regions_mem(
+                let heuristic_md = match extract_tables_in_regions_mem(
                     buffer,
                     &[(input.page, vec![input.crop_pdf_pt_bbox])],
-                )?;
-                let md = heuristic
-                    .into_iter()
-                    .next()
-                    .and_then(|page_result| page_result.regions.into_iter().next().map(|r| r.text))
-                    .unwrap_or_default();
-                TableExtractionResult {
-                    markdown: md,
-                    fallback_reason: Some(reason),
+                ) {
+                    Ok(pages) => pages
+                        .into_iter()
+                        .next()
+                        .and_then(|p| p.regions.into_iter().next().map(|r| r.text))
+                        .unwrap_or_default(),
+                    Err(_) => {
+                        // Heuristic threw — keep raw TSR markdown.
+                        results.push(TableExtractionResult {
+                            markdown: tsr_md,
+                            fallback_reason: Some(format!("{reason}_heuristic_error")),
+                        });
+                        continue;
+                    }
+                };
+                if heuristic_md.trim().is_empty() {
+                    // Heuristic produced nothing useful — keep TSR
+                    // markdown rather than ship empty. The reason
+                    // suffix lets callers count this case.
+                    TableExtractionResult {
+                        markdown: tsr_md,
+                        fallback_reason: Some(format!("{reason}_heuristic_empty")),
+                    }
+                } else {
+                    TableExtractionResult {
+                        markdown: heuristic_md,
+                        fallback_reason: Some(reason),
+                    }
                 }
             }
         };
