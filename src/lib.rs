@@ -931,24 +931,73 @@ pub fn extract_tables_with_structure_cells_mem(
 
         normalize_cell_bands(&mut cells);
 
-        // Stage 1: strict text fill — each cell gets the items whose centers
-        // fall inside its (normalized) bbox or whose >=60% overlap rule fires.
-        // Track which item indices any cell claimed so the orphan pass below
-        // doesn't double-assign.
+        // Stage 1: exclusive per-item assignment. For each PDF text item,
+        // find the cell(s) whose (band-clamped) bbox satisfies the strict
+        // membership rule (`tsr_region_contains_item`: center inside OR
+        // >=60% overlap on both axes). If multiple cells qualify, assign
+        // the item to the cell whose center is geometrically closest. If
+        // exactly one qualifies, assign to that. If none, the item is an
+        // orphan and stage 2 below tries to recover it.
+        //
+        // The exclusivity (one item → one cell) prevents the cell-overlap
+        // bug where SLANet emits cells whose y-extents overlap between
+        // rows: under the previous "for each cell, gather items" approach,
+        // an item whose center fell in two cells' overlap got duplicated
+        // into both. Closest-center disambiguation routes it to the
+        // correct row.
         let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for cell in &mut cells {
-            let [x1, y1, x2, y2] = cell.page_pt_bbox;
-            let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
-            let mut matched: Vec<TextItem> = Vec::new();
-            for (i, item) in items.iter().enumerate() {
-                if tsr_region_contains_item(item, bounds) {
-                    claimed.insert(i);
-                    matched.push(item.clone());
+        let mut item_to_cell: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+
+        // Pre-compute each cell's bounds + center (in PDF-pt-flipped space)
+        // so we don't redo the work per item.
+        let cell_meta: Vec<Option<(RegionBounds, f32, f32)>> = cells
+            .iter()
+            .map(|cell| {
+                let [x1, y1, x2, y2] = cell.page_pt_bbox;
+                if x1 >= x2 || y1 >= y2 {
+                    return None;
+                }
+                let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
+                let cx = (bounds.x_min + bounds.x_max) * 0.5;
+                let cy = (bounds.y_min + bounds.y_max) * 0.5;
+                Some((bounds, cx, cy))
+            })
+            .collect();
+
+        for (item_idx, item) in items.iter().enumerate() {
+            let item_w = text_utils::effective_width(item);
+            let item_cx = item.x + item_w * 0.5;
+            let item_cy = item.y + item.height * 0.5;
+            let mut best: Option<(usize, f32)> = None;
+            for (cell_idx, meta) in cell_meta.iter().enumerate() {
+                let Some((bounds, ccx, ccy)) = meta else {
+                    continue;
+                };
+                if !tsr_region_contains_item(item, *bounds) {
+                    continue;
+                }
+                let dx = item_cx - ccx;
+                let dy = item_cy - ccy;
+                let dist_sq = dx * dx + dy * dy;
+                if best.is_none_or(|(_, d)| dist_sq < d) {
+                    best = Some((cell_idx, dist_sq));
                 }
             }
-            // Markdown cells must be one line — collapse line breaks produced
-            // by the line-grouping pass.
-            cell.text = collect_text_from_matched_items(matched, adaptive_threshold)
+            if let Some((ci, _)) = best {
+                claimed.insert(item_idx);
+                item_to_cell.insert(item_idx, ci);
+            }
+        }
+
+        // Build per-cell text from the assigned items. Markdown cells must
+        // be one line — collapse line breaks from the line-grouping pass.
+        let mut per_cell_items: Vec<Vec<TextItem>> = vec![Vec::new(); cells.len()];
+        for (&item_idx, &cell_idx) in &item_to_cell {
+            per_cell_items[cell_idx].push(items[item_idx].clone());
+        }
+        for (cell_idx, matched) in per_cell_items.into_iter().enumerate() {
+            cells[cell_idx].text = collect_text_from_matched_items(matched, adaptive_threshold)
                 .replace(['\n', '\r'], " ");
         }
 
