@@ -4,10 +4,11 @@ use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, S
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_pages_markdown, extract_pages_markdown_mem,
-    extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
-    extract_text_with_positions, process_pdf_mem, process_pdf_with_options, to_markdown,
-    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
+    detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
+    extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
+    extract_text_in_regions_mem, extract_text_with_positions, process_pdf_mem,
+    process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType,
+    TextItem,
 };
 use std::collections::HashSet;
 
@@ -1702,6 +1703,205 @@ fn synthetic_dense_table_pdf() -> Vec<u8> {
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).unwrap();
     bytes
+}
+
+fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    fn push_grid(
+        operations: &mut Vec<Operation>,
+        x_left: i64,
+        x_mid: i64,
+        x_right: i64,
+        y_top: i64,
+        y_mid: i64,
+        y_bottom: i64,
+    ) {
+        for y in [y_top, y_mid, y_bottom] {
+            operations.push(Operation::new("m", vec![x_left.into(), y.into()]));
+            operations.push(Operation::new("l", vec![x_right.into(), y.into()]));
+        }
+        for x in [x_left, x_mid, x_right] {
+            operations.push(Operation::new("m", vec![x.into(), y_bottom.into()]));
+            operations.push(Operation::new("l", vec![x.into(), y_top.into()]));
+        }
+        operations.push(Operation::new("S", vec![]));
+    }
+
+    fn push_text(operations: &mut Vec<Operation>, x: i64, y: i64, text: &str) {
+        operations.push(Operation::new(
+            "Tm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
+        ));
+        operations.push(Operation::new("Tj", vec![Object::string_literal(text)]));
+    }
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let mut operations = Vec::new();
+    push_grid(&mut operations, 50, 130, 210, 740, 710, 670);
+    if two_tables {
+        push_grid(&mut operations, 50, 130, 210, 560, 530, 490);
+    }
+
+    operations.push(Operation::new("BT", vec![]));
+    operations.push(Operation::new("Tf", vec!["F1".into(), 10.into()]));
+    push_text(&mut operations, 70, 724, "A1");
+    push_text(&mut operations, 150, 724, "B1");
+    push_text(&mut operations, 70, 688, "A2");
+    push_text(&mut operations, 150, 688, "B2");
+    if two_tables {
+        push_text(&mut operations, 70, 544, "C1");
+        push_text(&mut operations, 150, 544, "D1");
+        push_text(&mut operations, 70, 508, "C2");
+        push_text(&mut operations, 150, 508, "D2");
+    }
+    operations.push(Operation::new("ET", vec![]));
+
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn assert_close(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() < 0.75,
+        "expected {actual} to be close to {expected}"
+    );
+}
+
+#[test]
+fn test_detect_vector_grid_in_region_line_pdf() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+
+    let buf = synthetic_vector_grid_pdf(false);
+    let crop = [50.0_f32, 60.0, 210.0, 130.0];
+    let detected = detect_vector_grid_in_region_mem(&buf, 0, crop, 72.0)
+        .unwrap()
+        .expect("ruled vector table should be detected");
+
+    assert_eq!(detected.cell_bboxes.len(), 4);
+    assert_eq!(
+        detected
+            .structure_tokens
+            .iter()
+            .filter(|tok| tok.as_str() == "<td></td>")
+            .count(),
+        4
+    );
+    assert_eq!(detected.structure_tokens.first().unwrap(), "<table>");
+    assert_eq!(detected.structure_tokens.last().unwrap(), "</table>");
+
+    let first = &detected.cell_bboxes[0];
+    assert_close(first[0], 0.0);
+    assert_close(first[1], 0.0);
+    assert_close(first[2], 80.0);
+    assert_close(first[3], 30.0);
+
+    let markdown = extract_tables_with_structure_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: crop,
+            render_dpi: 72.0,
+            structure_tokens: detected.structure_tokens,
+            cell_bboxes: detected.cell_bboxes,
+        }],
+    )
+    .unwrap()
+    .remove(0);
+
+    assert!(markdown.contains("A1"));
+    assert!(markdown.contains("B1"));
+    assert!(markdown.contains("A2"));
+    assert!(markdown.contains("B2"));
+}
+
+#[test]
+fn test_detect_vector_grid_in_region_text_pdf_returns_none() {
+    let buf = make_minimal_text_pdf();
+    let detected =
+        detect_vector_grid_in_region_mem(&buf, 0, [0.0, 0.0, 300.0, 800.0], 72.0).unwrap();
+    assert!(detected.is_none());
+}
+
+#[test]
+fn test_detect_vector_grid_in_region_filters_to_requested_table() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+
+    let buf = synthetic_vector_grid_pdf(true);
+    let second_table_crop = [50.0_f32, 240.0, 210.0, 310.0];
+    let detected = detect_vector_grid_in_region_mem(&buf, 0, second_table_crop, 72.0)
+        .unwrap()
+        .expect("second ruled table should be detected");
+
+    assert_eq!(detected.cell_bboxes.len(), 4);
+    let markdown = extract_tables_with_structure_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: second_table_crop,
+            render_dpi: 72.0,
+            structure_tokens: detected.structure_tokens,
+            cell_bboxes: detected.cell_bboxes,
+        }],
+    )
+    .unwrap()
+    .remove(0);
+
+    assert!(markdown.contains("C1"));
+    assert!(markdown.contains("D2"));
+    assert!(!markdown.contains("A1"));
+    assert!(!markdown.contains("B2"));
 }
 
 #[test]

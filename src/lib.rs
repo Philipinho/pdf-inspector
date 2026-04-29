@@ -784,6 +784,591 @@ pub fn extract_tables_in_regions_mem(
     Ok(results)
 }
 
+/// Region-scoped vector grid detection result for TSR-compatible callers.
+#[derive(Debug, Clone)]
+pub struct VectorGridDetection {
+    /// HTML-like structure tokens consumed by the TSR path.
+    pub structure_tokens: Vec<String>,
+    /// One crop-pixel bbox per `<td>` token, in document order.
+    pub cell_bboxes: Vec<Vec<f32>>,
+}
+
+#[derive(Clone, Copy)]
+enum VectorGridSource {
+    Rects,
+    Lines,
+}
+
+/// Detect a vector ruled-line / rectangle grid inside one page region.
+///
+/// The returned shape intentionally matches [`TsrTableInput`]'s structure
+/// fields so callers can hand it to `extract_tables_with_structure_*` and let
+/// the existing PDF-text cell fill path populate contents.
+pub fn detect_vector_grid_in_region_mem(
+    buffer: &[u8],
+    page_idx: u32,
+    region_pdf_pt_bbox: [f32; 4],
+    render_dpi: f32,
+) -> Result<Option<VectorGridDetection>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let pages = doc.get_pages();
+
+    let page_1idx = page_idx + 1;
+    let Some(&page_id) = pages.get(&page_1idx) else {
+        return Ok(None);
+    };
+
+    let needed_pages = HashSet::from([page_1idx]);
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
+    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
+    let ((mut items, rects, lines), _has_gid, coords_rotated) =
+        extractor::content_stream::extract_page_text_items(
+            &doc,
+            page_id,
+            page_1idx,
+            &font_cmaps,
+            false,
+        )?;
+    text_utils::fix_letterspaced_items(&mut items);
+
+    let coords = if coords_rotated {
+        RegionCoordSpace::Rotated90Ccw
+    } else {
+        RegionCoordSpace::Standard
+    };
+    if matches!(coords, RegionCoordSpace::Rotated90Ccw) {
+        // TODO: add a rotated-page vector-grid fixture before enabling this.
+        // The TSR crop contract is top-left page coordinates, while rotated
+        // extraction normalizes vector geometry into a synthetic coordinate
+        // space. Returning None is safer than emitting misleading bboxes.
+        return Ok(None);
+    }
+    let [rx1, ry1, rx2, ry2] = region_pdf_pt_bbox;
+    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
+
+    let items_in_region: Vec<TextItem> = items
+        .iter()
+        .filter(|item| region_overlaps_item(item, bounds))
+        .cloned()
+        .collect();
+    if items_in_region.is_empty() {
+        return Ok(None);
+    }
+
+    let rects_in_region: Vec<PdfRect> = rects
+        .iter()
+        .filter(|rect| region_overlaps_rect(rect, bounds))
+        .cloned()
+        .collect();
+    let lines_in_region: Vec<PdfLine> = lines
+        .iter()
+        .filter(|line| region_overlaps_line(line, bounds))
+        .cloned()
+        .collect();
+
+    // Match the existing geometry pipeline priority: rect-backed grids first,
+    // then line-backed grids. The detector output is only the validity gate;
+    // bboxes below are rebuilt from the filtered vector geometry because Table
+    // stores centers for some rect paths and row starts for line paths.
+    let (rect_tables, _) =
+        tables::detect_tables_from_rects(&items_in_region, &rects_in_region, page_1idx);
+    for table in rect_tables {
+        if let Some(result) = vector_grid_result_from_table(
+            &table,
+            VectorGridSource::Rects,
+            &rects_in_region,
+            &lines_in_region,
+            region_pdf_pt_bbox,
+            render_dpi,
+            page_h,
+            coords,
+        ) {
+            return Ok(Some(result));
+        }
+    }
+
+    let line_tables =
+        tables::detect_tables_from_lines(&items_in_region, &lines_in_region, page_1idx);
+    for table in line_tables {
+        if let Some(result) = vector_grid_result_from_table(
+            &table,
+            VectorGridSource::Lines,
+            &rects_in_region,
+            &lines_in_region,
+            region_pdf_pt_bbox,
+            render_dpi,
+            page_h,
+            coords,
+        ) {
+            return Ok(Some(result));
+        }
+    }
+
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vector_grid_result_from_table(
+    table: &tables::Table,
+    source: VectorGridSource,
+    rects: &[PdfRect],
+    lines: &[PdfLine],
+    crop_pdf_pt_bbox: [f32; 4],
+    render_dpi: f32,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) -> Option<VectorGridDetection> {
+    let num_rows = table.cells.len();
+    let num_cols = table.cells.first().map_or(0, Vec::len);
+    if num_rows == 0 || num_cols == 0 || table.cells.iter().any(|row| row.len() != num_cols) {
+        return None;
+    }
+
+    let (x_edges, y_edges) = match source {
+        VectorGridSource::Rects => rect_grid_edges(rects, num_cols, num_rows)
+            .or_else(|| inferred_grid_edges(table, rects, lines, num_cols, num_rows))?,
+        VectorGridSource::Lines => line_grid_edges(table, lines, num_cols, num_rows)
+            .or_else(|| inferred_grid_edges(table, rects, lines, num_cols, num_rows))?,
+    };
+
+    if x_edges.len() != num_cols + 1 || y_edges.len() != num_rows + 1 {
+        return None;
+    }
+
+    let mut structure_tokens = Vec::with_capacity(num_rows * (num_cols + 2) + 2);
+    let mut cell_bboxes = Vec::with_capacity(num_rows * num_cols);
+    structure_tokens.push("<table>".to_string());
+
+    // TODO: refactor vector detectors to return normalized `(x_edges, y_edges)`.
+    // Today `Table.columns` / `Table.rows` have detector-specific semantics,
+    // so this export reconstructs edges from the validated table plus geometry.
+    // Keep v1 structural output uniform: the downstream TSR text-fill path
+    // does not require header semantics, and reliable header detection can be
+    // layered later without changing the geometry contract.
+    for r in 0..num_rows {
+        structure_tokens.push("<tr>".to_string());
+        for c in 0..num_cols {
+            structure_tokens.push("<td></td>".to_string());
+            let bbox_px = extracted_cell_to_crop_px(
+                [x_edges[c], y_edges[r + 1], x_edges[c + 1], y_edges[r]],
+                crop_pdf_pt_bbox,
+                render_dpi,
+                page_height,
+                coord_space,
+            )?;
+            if !crop_px_bbox_is_plausible(bbox_px, crop_pdf_pt_bbox, render_dpi) {
+                return None;
+            }
+            cell_bboxes.push(bbox_px.to_vec());
+        }
+        structure_tokens.push("</tr>".to_string());
+    }
+
+    structure_tokens.push("</table>".to_string());
+    Some(VectorGridDetection {
+        structure_tokens,
+        cell_bboxes,
+    })
+}
+
+fn crop_px_bbox_is_plausible(
+    bbox_px: [f32; 4],
+    crop_pdf_pt_bbox: [f32; 4],
+    render_dpi: f32,
+) -> bool {
+    let ppi = if render_dpi > 0.0 {
+        render_dpi / 72.0
+    } else {
+        1.0
+    };
+    let crop_w = (crop_pdf_pt_bbox[2] - crop_pdf_pt_bbox[0]).abs() * ppi;
+    let crop_h = (crop_pdf_pt_bbox[3] - crop_pdf_pt_bbox[1]).abs() * ppi;
+    let slack = 1.0;
+    bbox_px[0] >= -slack
+        && bbox_px[1] >= -slack
+        && bbox_px[2] <= crop_w + slack
+        && bbox_px[3] <= crop_h + slack
+}
+
+#[cfg(test)]
+mod vector_grid_tests {
+    use super::crop_px_bbox_is_plausible;
+
+    #[test]
+    fn test_crop_px_bbox_is_plausible_bounds() {
+        let crop = [10.0, 20.0, 110.0, 220.0];
+
+        assert!(crop_px_bbox_is_plausible(
+            [0.0, 0.0, 100.0, 200.0],
+            crop,
+            72.0
+        ));
+        assert!(crop_px_bbox_is_plausible(
+            [0.0, 0.0, 200.0, 400.0],
+            crop,
+            144.0
+        ));
+        assert!(!crop_px_bbox_is_plausible(
+            [-2.0, 0.0, 50.0, 100.0],
+            crop,
+            72.0
+        ));
+        assert!(!crop_px_bbox_is_plausible(
+            [0.0, -2.0, 50.0, 100.0],
+            crop,
+            72.0
+        ));
+        assert!(!crop_px_bbox_is_plausible(
+            [0.0, 0.0, 102.0, 200.0],
+            crop,
+            72.0
+        ));
+        assert!(!crop_px_bbox_is_plausible(
+            [0.0, 0.0, 100.0, 202.0],
+            crop,
+            72.0
+        ));
+
+        // Boundary values at the existing 1px slack should remain valid.
+        assert!(crop_px_bbox_is_plausible(
+            [-1.0, -1.0, 101.0, 201.0],
+            crop,
+            72.0
+        ));
+
+        // Non-positive DPI falls back to 1.0 ppi, so crop points equal pixels.
+        assert!(crop_px_bbox_is_plausible(
+            [0.0, 0.0, 100.0, 200.0],
+            crop,
+            0.0
+        ));
+        assert!(crop_px_bbox_is_plausible(
+            [0.0, 0.0, 100.0, 200.0],
+            crop,
+            -144.0
+        ));
+        assert!(!crop_px_bbox_is_plausible(
+            [0.0, 0.0, 102.0, 200.0],
+            crop,
+            -144.0
+        ));
+    }
+}
+
+fn line_grid_edges(
+    table: &tables::Table,
+    lines: &[PdfLine],
+    num_cols: usize,
+    num_rows: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if lines.is_empty() || table.columns.len() != num_cols + 1 || table.rows.len() != num_rows {
+        return None;
+    }
+
+    let angle_tolerance = 2.0_f32.to_radians().tan();
+    let mut ys = Vec::new();
+
+    for line in lines {
+        let dx = (line.x2 - line.x1).abs();
+        let dy = (line.y2 - line.y1).abs();
+        let length = (dx * dx + dy * dy).sqrt();
+        if length < 20.0 {
+            continue;
+        }
+        if dx > 0.01 && dy / dx <= angle_tolerance {
+            ys.push((line.y1 + line.y2) * 0.5);
+        }
+    }
+
+    let mut x_edges = table.columns.clone();
+    x_edges.sort_by(|a, b| a.total_cmp(b));
+
+    let snapped_y = snap_vector_edges(ys, true);
+    let mut y_edges = Vec::with_capacity(num_rows + 1);
+    for &row_top in &table.rows {
+        let matched = snapped_y
+            .iter()
+            .copied()
+            .find(|y| (*y - row_top).abs() <= 3.0)
+            .unwrap_or(row_top);
+        y_edges.push(matched);
+    }
+
+    let last_top = *y_edges.last()?;
+    let bottom = snapped_y
+        .iter()
+        .copied()
+        .filter(|y| *y < last_top - 3.0)
+        .max_by(|a, b| a.total_cmp(b))?;
+    y_edges.push(bottom);
+
+    if x_edges.len() == num_cols + 1 && y_edges.len() == num_rows + 1 {
+        Some((x_edges, y_edges))
+    } else {
+        None
+    }
+}
+
+fn rect_grid_edges(
+    rects: &[PdfRect],
+    num_cols: usize,
+    num_rows: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if rects.is_empty() {
+        return None;
+    }
+
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for rect in rects {
+        let (x1, y1, x2, y2) = normalized_rect_edges(rect);
+        if (x2 - x1) < 5.0 || (y2 - y1) < 5.0 {
+            continue;
+        }
+        xs.push(x1);
+        xs.push(x2);
+        ys.push(y1);
+        ys.push(y2);
+    }
+
+    let x_edges = snap_vector_edges(xs, false);
+    let y_edges = snap_vector_edges(ys, true);
+    if x_edges.len() == num_cols + 1 && y_edges.len() == num_rows + 1 {
+        Some((x_edges, y_edges))
+    } else {
+        None
+    }
+}
+
+fn inferred_grid_edges(
+    table: &tables::Table,
+    rects: &[PdfRect],
+    lines: &[PdfLine],
+    num_cols: usize,
+    num_rows: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let bounds = vector_geometry_bounds(rects, lines);
+    let x_edges = if table.columns.len() == num_cols + 1 {
+        let mut edges = table.columns.clone();
+        edges.sort_by(|a, b| a.total_cmp(b));
+        Some(edges)
+    } else {
+        infer_ascending_edges(&table.columns, num_cols, bounds.map(|b| (b.x_min, b.x_max)))
+    }?;
+
+    let y_edges = if table.rows.len() == num_rows + 1 {
+        let mut edges = table.rows.clone();
+        edges.sort_by(|a, b| b.total_cmp(a));
+        Some(edges)
+    } else {
+        infer_descending_edges(&table.rows, num_rows, bounds.map(|b| (b.y_min, b.y_max)))
+    }?;
+
+    Some((x_edges, y_edges))
+}
+
+fn infer_ascending_edges(
+    positions: &[f32],
+    expected_centers: usize,
+    bounds: Option<(f32, f32)>,
+) -> Option<Vec<f32>> {
+    if positions.len() != expected_centers || positions.is_empty() {
+        return None;
+    }
+    let mut centers = positions.to_vec();
+    centers.sort_by(|a, b| a.total_cmp(b));
+    if centers.len() == 1 {
+        return None;
+    }
+
+    let mut edges = Vec::with_capacity(centers.len() + 1);
+    let first_gap = centers[1] - centers[0];
+    let last_gap = centers[centers.len() - 1] - centers[centers.len() - 2];
+    let left = bounds
+        .map(|(min, _)| min)
+        .filter(|min| min.is_finite() && *min < centers[0])
+        .unwrap_or(centers[0] - first_gap * 0.5);
+    let right = bounds
+        .map(|(_, max)| max)
+        .filter(|max| max.is_finite() && *max > *centers.last().unwrap())
+        .unwrap_or(*centers.last().unwrap() + last_gap * 0.5);
+
+    edges.push(left);
+    for pair in centers.windows(2) {
+        edges.push((pair[0] + pair[1]) * 0.5);
+    }
+    edges.push(right);
+
+    strictly_ordered(&edges, false).then_some(edges)
+}
+
+fn infer_descending_edges(
+    positions: &[f32],
+    expected_centers: usize,
+    bounds: Option<(f32, f32)>,
+) -> Option<Vec<f32>> {
+    if positions.len() != expected_centers || positions.is_empty() {
+        return None;
+    }
+    let mut centers = positions.to_vec();
+    centers.sort_by(|a, b| b.total_cmp(a));
+    if centers.len() == 1 {
+        return None;
+    }
+
+    let mut edges = Vec::with_capacity(centers.len() + 1);
+    let first_gap = centers[0] - centers[1];
+    let last_gap = centers[centers.len() - 2] - centers[centers.len() - 1];
+    let top = bounds
+        .map(|(_, max)| max)
+        .filter(|max| max.is_finite() && *max > centers[0])
+        .unwrap_or(centers[0] + first_gap * 0.5);
+    let bottom = bounds
+        .map(|(min, _)| min)
+        .filter(|min| min.is_finite() && *min < *centers.last().unwrap())
+        .unwrap_or(*centers.last().unwrap() - last_gap * 0.5);
+
+    edges.push(top);
+    for pair in centers.windows(2) {
+        edges.push((pair[0] + pair[1]) * 0.5);
+    }
+    edges.push(bottom);
+
+    strictly_ordered(&edges, true).then_some(edges)
+}
+
+fn snap_vector_edges(mut values: Vec<f32>, descending: bool) -> Vec<f32> {
+    values.retain(|v| v.is_finite());
+    values.sort_by(|a, b| a.total_cmp(b));
+
+    let mut snapped: Vec<f32> = Vec::new();
+    let mut cluster: Vec<f32> = Vec::new();
+    for value in values {
+        if cluster
+            .last()
+            .is_some_and(|last| (value - *last).abs() <= 3.0)
+        {
+            cluster.push(value);
+        } else {
+            if !cluster.is_empty() {
+                snapped.push(cluster.iter().sum::<f32>() / cluster.len() as f32);
+            }
+            cluster = vec![value];
+        }
+    }
+    if !cluster.is_empty() {
+        snapped.push(cluster.iter().sum::<f32>() / cluster.len() as f32);
+    }
+    if descending {
+        snapped.sort_by(|a, b| b.total_cmp(a));
+    }
+    snapped
+}
+
+fn strictly_ordered(values: &[f32], descending: bool) -> bool {
+    values.windows(2).all(|pair| {
+        pair[0].is_finite()
+            && pair[1].is_finite()
+            && if descending {
+                pair[0] > pair[1]
+            } else {
+                pair[0] < pair[1]
+            }
+    })
+}
+
+fn normalized_rect_edges(rect: &PdfRect) -> (f32, f32, f32, f32) {
+    let x2 = rect.x + rect.width;
+    let y2 = rect.y + rect.height;
+    (
+        rect.x.min(x2),
+        rect.y.min(y2),
+        rect.x.max(x2),
+        rect.y.max(y2),
+    )
+}
+
+fn vector_geometry_bounds(rects: &[PdfRect], lines: &[PdfLine]) -> Option<RegionBounds> {
+    let mut bounds: Option<RegionBounds> = None;
+    let mut include = |x1: f32, y1: f32, x2: f32, y2: f32| {
+        let next = RegionBounds {
+            x_min: x1.min(x2),
+            y_min: y1.min(y2),
+            x_max: x1.max(x2),
+            y_max: y1.max(y2),
+        };
+        bounds = Some(if let Some(prev) = bounds {
+            RegionBounds {
+                x_min: prev.x_min.min(next.x_min),
+                y_min: prev.y_min.min(next.y_min),
+                x_max: prev.x_max.max(next.x_max),
+                y_max: prev.y_max.max(next.y_max),
+            }
+        } else {
+            next
+        });
+    };
+
+    for rect in rects {
+        let (x1, y1, x2, y2) = normalized_rect_edges(rect);
+        include(x1, y1, x2, y2);
+    }
+    for line in lines {
+        include(line.x1, line.y1, line.x2, line.y2);
+    }
+
+    bounds
+}
+
+fn extracted_cell_to_crop_px(
+    bbox: [f32; 4],
+    crop_pdf_pt_bbox: [f32; 4],
+    render_dpi: f32,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) -> Option<[f32; 4]> {
+    let [x1, y1, x2, y2] = extracted_bbox_to_page_top_left(bbox, page_height, coord_space);
+    if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+        return None;
+    }
+    if x1 >= x2 || y1 >= y2 {
+        return None;
+    }
+
+    let ppi = if render_dpi > 0.0 {
+        render_dpi / 72.0
+    } else {
+        1.0
+    };
+    let [crop_x1, crop_y1, _, _] = crop_pdf_pt_bbox;
+    Some([
+        (x1 - crop_x1) * ppi,
+        (y1 - crop_y1) * ppi,
+        (x2 - crop_x1) * ppi,
+        (y2 - crop_y1) * ppi,
+    ])
+}
+
+fn extracted_bbox_to_page_top_left(
+    bbox: [f32; 4],
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) -> [f32; 4] {
+    let [x1, y1, x2, y2] = bbox;
+    let x_min = x1.min(x2);
+    let x_max = x1.max(x2);
+    let y_min = y1.min(y2);
+    let y_max = y1.max(y2);
+
+    match coord_space {
+        RegionCoordSpace::Standard => [x_min, page_height - y_max, x_max, page_height - y_min],
+        RegionCoordSpace::Rotated90Ccw => {
+            [-y_max, page_height - x_max, -y_min, page_height - x_min]
+        }
+    }
+}
+
 // =========================================================================
 // Region-based table extraction with external structure recovery (TSR)
 // =========================================================================
@@ -1651,6 +2236,45 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
         - item_y_min.max(bounds.y_min - REGION_MARGIN))
     .max(0.0);
     x_overlap > 0.0 && y_overlap > 0.0
+}
+
+fn region_overlaps_rect(rect: &PdfRect, bounds: RegionBounds) -> bool {
+    const REGION_MARGIN: f32 = 1.5;
+    let (x_min, y_min, x_max, y_max) = normalized_rect_edges(rect);
+    ranges_overlap(
+        x_min,
+        x_max,
+        bounds.x_min - REGION_MARGIN,
+        bounds.x_max + REGION_MARGIN,
+    ) && ranges_overlap(
+        y_min,
+        y_max,
+        bounds.y_min - REGION_MARGIN,
+        bounds.y_max + REGION_MARGIN,
+    )
+}
+
+fn region_overlaps_line(line: &PdfLine, bounds: RegionBounds) -> bool {
+    const REGION_MARGIN: f32 = 1.5;
+    let x_min = line.x1.min(line.x2);
+    let x_max = line.x1.max(line.x2);
+    let y_min = line.y1.min(line.y2);
+    let y_max = line.y1.max(line.y2);
+    ranges_overlap(
+        x_min,
+        x_max,
+        bounds.x_min - REGION_MARGIN,
+        bounds.x_max + REGION_MARGIN,
+    ) && ranges_overlap(
+        y_min,
+        y_max,
+        bounds.y_min - REGION_MARGIN,
+        bounds.y_max + REGION_MARGIN,
+    )
+}
+
+fn ranges_overlap(a_min: f32, a_max: f32, b_min: f32, b_max: f32) -> bool {
+    a_max >= b_min && b_max >= a_min
 }
 
 fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {

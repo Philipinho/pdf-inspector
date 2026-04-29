@@ -99,6 +99,13 @@ pub struct PageRegionTexts {
     pub regions: Vec<RegionText>,
 }
 
+/// Vector-grid detection result compatible with `extractTablesWithStructure*`.
+#[napi(object)]
+pub struct VectorGridDetectionJs {
+    pub structure_tokens: Vec<String>,
+    pub cell_bboxes: Vec<Vec<f64>>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -314,6 +321,53 @@ pub fn extract_tables_in_regions(
         let results = pdf_inspector::extract_tables_in_regions_mem(&bytes, &regions)
             .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
         Ok(to_page_region_texts(results))
+    })
+}
+
+/// Detect a vector ruled-line / rectangle grid inside one page region.
+///
+/// Returns TSR-compatible structure tokens plus crop-pixel cell bboxes, or
+/// `null` when the region does not contain a valid vector grid.
+///
+/// `pageIdx` is 0-indexed. `regionPdfPtBbox` is `[x1,y1,x2,y2]` in PDF
+/// points with top-left origin. `renderDpi` is the DPI of the crop image that
+/// will consume the returned cell bboxes.
+#[napi]
+pub fn detect_vector_grid_in_region(
+    buffer: Buffer,
+    page_idx: u32,
+    region_pdf_pt_bbox: Vec<f64>,
+    render_dpi: f64,
+) -> Result<Option<VectorGridDetectionJs>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let region = if region_pdf_pt_bbox.len() == 4 {
+        [
+            region_pdf_pt_bbox[0] as f32,
+            region_pdf_pt_bbox[1] as f32,
+            region_pdf_pt_bbox[2] as f32,
+            region_pdf_pt_bbox[3] as f32,
+        ]
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    };
+
+    catch_panic("detect_vector_grid_in_region", move || {
+        let result = pdf_inspector::detect_vector_grid_in_region_mem(
+            &bytes,
+            page_idx,
+            region,
+            render_dpi as f32,
+        )
+        .map_err(|e| to_napi_err(e, "detect_vector_grid_in_region"))?;
+
+        Ok(result.map(|r| VectorGridDetectionJs {
+            structure_tokens: r.structure_tokens,
+            cell_bboxes: r
+                .cell_bboxes
+                .into_iter()
+                .map(|bbox| bbox.into_iter().map(|v| v as f64).collect())
+                .collect(),
+        }))
     })
 }
 

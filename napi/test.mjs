@@ -7,6 +7,7 @@ import {
   extractText,
   extractTextWithPositions,
   extractTextInRegions,
+  detectVectorGridInRegion,
   extractPagesMarkdown,
 } from './index.js';
 
@@ -89,6 +90,17 @@ assert.equal(regionResults[0].regions.length, 1);
 assert.equal(typeof regionResults[0].regions[0].text, 'string');
 assert.equal(typeof regionResults[0].regions[0].needsOcr, 'boolean');
 console.log('  extractTextInRegions: OK');
+
+// --- detectVectorGridInRegion ---
+console.log('Testing detectVectorGridInRegion...');
+const vectorGrid = detectVectorGridInRegion(fixture, 0, [0, 0, 600, 800], 72);
+assert.ok(vectorGrid === null || typeof vectorGrid === 'object');
+if (vectorGrid) {
+  assert.ok(Array.isArray(vectorGrid.structureTokens));
+  assert.ok(Array.isArray(vectorGrid.cellBboxes));
+  assert.ok(vectorGrid.cellBboxes.every(bbox => Array.isArray(bbox) && bbox.length === 4));
+}
+console.log('  detectVectorGridInRegion: OK');
 
 // --- extractPagesMarkdown ---
 console.log('Testing extractPagesMarkdown...');
