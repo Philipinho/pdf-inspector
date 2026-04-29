@@ -1812,6 +1812,93 @@ fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
     bytes
 }
 
+fn synthetic_vector_grid_three_row_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let mut operations = Vec::new();
+    for y in [740, 710, 680, 650] {
+        operations.push(Operation::new("m", vec![50.into(), y.into()]));
+        operations.push(Operation::new("l", vec![210.into(), y.into()]));
+    }
+    for x in [50, 130, 210] {
+        operations.push(Operation::new("m", vec![x.into(), 650.into()]));
+        operations.push(Operation::new("l", vec![x.into(), 740.into()]));
+    }
+    operations.push(Operation::new("S", vec![]));
+
+    operations.push(Operation::new("BT", vec![]));
+    operations.push(Operation::new("Tf", vec!["F1".into(), 10.into()]));
+    for (x, y, text) in [
+        (70, 724, "Branch"),
+        (150, 724, "Deposits"),
+        (70, 694, "Oak"),
+        (150, 694, "100"),
+        (70, 664, "Boardwalk"),
+        (150, 664, "200"),
+    ] {
+        operations.push(Operation::new(
+            "Tm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
+        ));
+        operations.push(Operation::new("Tj", vec![Object::string_literal(text)]));
+    }
+    operations.push(Operation::new("ET", vec![]));
+
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
 fn assert_close(actual: f32, expected: f32) {
     assert!(
         (actual - expected).abs() < 0.75,
@@ -2319,7 +2406,7 @@ fn test_auto_passes_through_clean_tsr_output() {
 }
 
 #[test]
-fn test_auto_falls_back_on_multi_row_in_cell() {
+fn test_auto_expands_multi_row_in_cell() {
     use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
 
     let buf = synthetic_dense_table_pdf();
@@ -2370,16 +2457,79 @@ fn test_auto_falls_back_on_multi_row_in_cell() {
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].fallback_reason.as_deref(),
-        Some("multi_row_in_cell"),
-        "expected multi_row_in_cell fallback, got {:?}",
+        Some("multi_row_in_cell_expanded"),
+        "expected multi_row_in_cell_expanded, got {:?}",
         results[0].fallback_reason
     );
-    // The heuristic-fallback markdown should preserve all three PDF rows.
+    // The in-place expansion should preserve all three PDF rows.
     let md = &results[0].markdown;
     assert!(md.contains("Oak Street"), "missing Oak Street: {md}");
     assert!(md.contains("Boardwalk"), "missing Boardwalk: {md}");
     assert!(md.contains("100"), "missing 100: {md}");
     assert!(md.contains("200"), "missing 200: {md}");
+    assert!(
+        !md.contains("Oak Street Boardwalk"),
+        "rows should not remain compressed: {md}"
+    );
+}
+
+#[test]
+fn test_auto_expands_under_counted_vector_grid_rows() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_vector_grid_three_row_pdf();
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let crop = [50.0, 60.0, 210.0, 150.0];
+    let cell_bboxes = vec![
+        poly(0.0, 0.0, 80.0, 30.0),
+        poly(80.0, 0.0, 160.0, 30.0),
+        poly(0.0, 30.0, 80.0, 90.0),
+        poly(80.0, 30.0, 160.0, 90.0),
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: crop,
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].fallback_reason.as_deref(),
+        Some("multi_row_in_cell_expanded")
+    );
+    let md = &results[0].markdown;
+    assert!(md.contains("|Branch|Deposits|"), "missing header: {md}");
+    assert!(md.contains("|Oak|100|"), "missing row 1: {md}");
+    assert!(md.contains("|Boardwalk|200|"), "missing row 2: {md}");
+    assert!(
+        !md.contains("Oak Boardwalk"),
+        "rows stayed compressed: {md}"
+    );
 }
 
 #[test]
@@ -2456,15 +2606,14 @@ fn test_auto_does_not_fire_on_legit_rowspan_cell() {
 }
 
 #[test]
-fn test_auto_keeps_tsr_markdown_when_heuristic_returns_empty() {
+fn test_auto_expands_when_heuristic_region_is_empty() {
     use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
 
     let buf = synthetic_dense_table_pdf();
     // Same shape as the multi_row_in_cell regression — a tall data cell
-    // that catches Oak Street + Boardwalk. But the crop bbox we pass
-    // points at a strip of the page that has NO text items, so the
-    // heuristic's region will be empty when it tries to extract there.
-    // The auto wrapper must keep the TSR markdown rather than ship "".
+    // that catches Oak Street + Boardwalk. The crop bbox we pass points
+    // at a strip of the page that has NO text items, so the old heuristic
+    // fallback would be empty. Expansion uses the cell bboxes directly.
     let tokens: Vec<String> = [
         "<table>",
         "<thead>",
@@ -2510,20 +2659,19 @@ fn test_auto_keeps_tsr_markdown_when_heuristic_returns_empty() {
     let r = &results[0];
     assert_eq!(
         r.fallback_reason.as_deref(),
-        Some("multi_row_in_cell_heuristic_empty"),
-        "expected _heuristic_empty suffix, got {:?}",
+        Some("multi_row_in_cell_expanded"),
+        "expected expansion despite empty heuristic region, got {:?}",
         r.fallback_reason,
     );
-    // TSR markdown should be preserved — non-empty, contains the cell
-    // text we know was assigned by the TSR path.
     assert!(
-        !r.markdown.trim().is_empty(),
-        "expected TSR markdown to be preserved, got empty",
+        r.markdown.contains("|Oak Street|100|"),
+        "missing row 1: {}",
+        r.markdown
     );
     assert!(
-        r.markdown.contains("Oak Street") || r.markdown.contains("Boardwalk"),
-        "expected TSR markdown to contain at least one row, got: {}",
-        r.markdown,
+        r.markdown.contains("|Boardwalk|200|"),
+        "missing row 2: {}",
+        r.markdown
     );
 }
 

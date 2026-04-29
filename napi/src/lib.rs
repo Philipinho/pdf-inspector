@@ -482,9 +482,10 @@ pub fn extract_tables_with_structure_cells(
 /// `fallbackReason` is `null` when the TSR-hybrid path produced the
 /// markdown directly. When stage 1's quality check fires (the cells
 /// look like a SLANet detection pathology — phantom rows or multi-row
-/// content in a single cell), the heuristic table extractor is run on
-/// the same region instead, and `fallbackReason` carries the diagnostic
-/// label (`"phantom_empty_row"`, `"multi_row_in_cell"`).
+/// content in a single cell), the auto path may expand the TSR cells
+/// in-place or run the heuristic table extractor on the same region.
+/// `fallbackReason` carries the diagnostic label (for example
+/// `"multi_row_in_cell_expanded"` or `"phantom_empty_row"`).
 #[napi(object)]
 pub struct TableExtractionResultJs {
     pub markdown: String,
@@ -494,13 +495,14 @@ pub struct TableExtractionResultJs {
 /// Auto-fallback variant of [`extractTablesWithStructure`].
 ///
 /// Runs the TSR-hybrid path, checks the resulting cells for known
-/// SLANet detection pathologies, and falls back to the heuristic
-/// `extractTablesInRegions` for any input where the TSR path looks
+/// SLANet detection pathologies, expands multi-row cells in-place when
+/// possible, and otherwise falls back to the heuristic
+/// `extractTablesInRegions` for inputs where the TSR path looks
 /// compromised.
 ///
 /// On clean inputs this returns identical markdown to
-/// `extractTablesWithStructure`; on flagged inputs the heuristic
-/// markdown replaces the TSR markdown and `fallbackReason` is set.
+/// `extractTablesWithStructure`; on flagged inputs `fallbackReason` is
+/// set to the recovery path that produced the result.
 #[napi]
 pub fn extract_tables_with_structure_auto(
     buffer: Buffer,

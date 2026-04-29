@@ -55,7 +55,7 @@ pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tounicode::FontCMaps;
 
@@ -1775,20 +1775,339 @@ pub fn extract_tables_with_structure_mem(
 ///
 /// `fallback_reason` is `None` when the TSR-hybrid path produced the
 /// markdown directly; `Some(<short identifier>)` when stage 1's quality
-/// check fired and the heuristic `extract_tables_in_regions_mem` was
-/// substituted instead. The reason string is stable enough to use as a
-/// metric label (e.g. `phantom_empty_row`, `multi_row_in_cell`).
+/// check fired and either in-place expansion or the heuristic fallback
+/// produced the output. The reason string is stable enough to use as a
+/// metric label (e.g. `multi_row_in_cell_expanded`, `phantom_empty_row`).
 #[derive(Debug, Clone)]
 pub struct TableExtractionResult {
     pub markdown: String,
     pub fallback_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum TsrQualityIssue {
+    PhantomEmptyRow,
+    MultiRowInCell {
+        expanded_cells: Option<Vec<tables::StructuredCell>>,
+    },
+}
+
+impl TsrQualityIssue {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::PhantomEmptyRow => "phantom_empty_row",
+            Self::MultiRowInCell { .. } => "multi_row_in_cell",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TsrCellTextLine {
+    center_y: f32,
+    half_height: f32,
+    items: Vec<TextItem>,
+}
+
+impl TsrCellTextLine {
+    fn new(item: TextItem) -> Self {
+        let center_y = item.y + item.height * 0.5;
+        let half_height = (item.height * 0.5).max(2.5);
+        Self {
+            center_y,
+            half_height,
+            items: vec![item],
+        }
+    }
+
+    fn add(&mut self, item: TextItem) {
+        let center_y = item.y + item.height * 0.5;
+        let existing = self.items.len() as f32;
+        self.center_y = (self.center_y * existing + center_y) / (existing + 1.0);
+        self.half_height = self.half_height.max((item.height * 0.5).max(2.5));
+        self.items.push(item);
+    }
+
+    fn bottom_y(&self) -> f32 {
+        self.items
+            .iter()
+            .map(|item| item.y)
+            .fold(f32::INFINITY, f32::min)
+    }
+}
+
+#[derive(Clone)]
+struct TsrRowExpansion {
+    bands: Vec<f32>,
+    tolerance: f32,
+}
+
+fn collect_items_in_tsr_cell(
+    items: &[TextItem],
+    cell: &tables::StructuredCell,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) -> Vec<TextItem> {
+    let [x1, y1, x2, y2] = cell.page_pt_bbox;
+    if x1 >= x2 || y1 >= y2 {
+        return Vec::new();
+    }
+    let bounds = region_bounds(x1, y1, x2, y2, page_height, coord_space);
+    items
+        .iter()
+        .filter(|item| !item.text.trim().is_empty() && tsr_region_contains_item(item, bounds))
+        .cloned()
+        .collect()
+}
+
+fn cluster_tsr_cell_text_lines(mut items: Vec<TextItem>) -> Vec<TsrCellTextLine> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    items.sort_by(|a, b| {
+        let ay = a.y + a.height * 0.5;
+        let by = b.y + b.height * 0.5;
+        by.total_cmp(&ay).then(a.x.total_cmp(&b.x))
+    });
+
+    let mut lines: Vec<TsrCellTextLine> = Vec::new();
+    for item in items {
+        let item_top = item.y + item.height;
+        let item_half_height = (item.height * 0.5).max(2.5);
+        if let Some(last) = lines.last_mut() {
+            let gap = last.bottom_y() - item_top;
+            if gap <= last.half_height.max(item_half_height) {
+                last.add(item);
+                continue;
+            }
+        }
+        lines.push(TsrCellTextLine::new(item));
+    }
+
+    lines
+}
+
+fn build_tsr_row_expansion(
+    row_cells: &[usize],
+    cells: &[tables::StructuredCell],
+    cell_lines: &[Vec<TsrCellTextLine>],
+) -> Option<TsrRowExpansion> {
+    if row_cells.is_empty() {
+        return None;
+    }
+    let has_spanning_cell = row_cells
+        .iter()
+        .any(|&idx| cells[idx].rowspan > 1 || cells[idx].colspan > 1);
+    if has_spanning_cell {
+        return None;
+    }
+
+    let multiline_cells = row_cells
+        .iter()
+        .filter(|&&idx| cell_lines[idx].len() >= 2)
+        .count();
+    if row_cells.len() >= 2 && multiline_cells < 2 {
+        return None;
+    }
+    if row_cells.len() == 1 && multiline_cells == 0 {
+        return None;
+    }
+
+    let mut centers: Vec<(f32, f32)> = row_cells
+        .iter()
+        .flat_map(|&idx| {
+            cell_lines[idx]
+                .iter()
+                .map(|line| (line.center_y, line.half_height))
+        })
+        .collect();
+    if centers.len() < 2 {
+        return None;
+    }
+    centers.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut half_heights: Vec<f32> = centers.iter().map(|(_, h)| *h).collect();
+    half_heights.sort_by(|a, b| a.total_cmp(b));
+    let tolerance = (half_heights[half_heights.len() / 2] * 0.8).max(3.0);
+
+    let mut bands: Vec<(f32, usize)> = Vec::new();
+    for (center, _) in centers {
+        if let Some((band_center, count)) = bands
+            .iter_mut()
+            .find(|(band_center, _)| (*band_center - center).abs() <= tolerance)
+        {
+            *band_center = (*band_center * *count as f32 + center) / (*count as f32 + 1.0);
+            *count += 1;
+        } else {
+            bands.push((center, 1));
+        }
+    }
+
+    // V1 targets the common 1-2 lost-row cases; larger compressions stay on
+    // the existing heuristic fallback path until we have evidence to broaden it.
+    if !(2..=4).contains(&bands.len()) {
+        return None;
+    }
+
+    let min_support = if row_cells.len() >= 2 { 2 } else { 1 };
+    let supported = bands.iter().all(|(band, _)| {
+        row_cells
+            .iter()
+            .filter(|&&idx| {
+                cell_lines[idx]
+                    .iter()
+                    .any(|line| (line.center_y - *band).abs() <= tolerance)
+            })
+            .count()
+            >= min_support
+    });
+    if !supported {
+        return None;
+    }
+
+    bands.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Some(TsrRowExpansion {
+        bands: bands.into_iter().map(|(center, _)| center).collect(),
+        tolerance,
+    })
+}
+
+fn text_for_tsr_band(
+    lines: &[TsrCellTextLine],
+    band: f32,
+    tolerance: f32,
+    adaptive_threshold: f32,
+) -> String {
+    let mut matched: Vec<TextItem> = lines
+        .iter()
+        .filter(|line| (line.center_y - band).abs() <= tolerance)
+        .flat_map(|line| line.items.iter().cloned())
+        .collect();
+    if matched.is_empty() {
+        return String::new();
+    }
+    matched.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    collect_text_from_matched_items(matched, adaptive_threshold).replace(['\n', '\r'], " ")
+}
+
+fn slice_cell_bbox_for_expanded_row(
+    cell: &tables::StructuredCell,
+    row_idx: usize,
+    row_count: usize,
+) -> [f32; 4] {
+    let mut bbox = cell.page_pt_bbox;
+    let top = bbox[1].min(bbox[3]);
+    let bottom = bbox[1].max(bbox[3]);
+    let height = bottom - top;
+    if height <= 0.0 || row_count == 0 {
+        return bbox;
+    }
+    let step = height / row_count as f32;
+    bbox[1] = top + step * row_idx as f32;
+    bbox[3] = if row_idx + 1 == row_count {
+        bottom
+    } else {
+        top + step * (row_idx + 1) as f32
+    };
+    bbox
+}
+
+fn try_expand_multi_row_cells(
+    cells: &[tables::StructuredCell],
+    items: &[TextItem],
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+    adaptive_threshold: f32,
+) -> Option<Vec<tables::StructuredCell>> {
+    if cells.is_empty() {
+        return None;
+    }
+
+    let cell_lines: Vec<Vec<TsrCellTextLine>> = cells
+        .iter()
+        .map(|cell| {
+            if cell.rowspan > 1 {
+                Vec::new()
+            } else {
+                cluster_tsr_cell_text_lines(collect_items_in_tsr_cell(
+                    items,
+                    cell,
+                    page_height,
+                    coord_space,
+                ))
+            }
+        })
+        .collect();
+
+    let mut cells_by_row: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (idx, cell) in cells.iter().enumerate() {
+        cells_by_row.entry(cell.row).or_default().push(idx);
+    }
+
+    let mut expansions: HashMap<usize, TsrRowExpansion> = HashMap::new();
+    for (&row, row_cells) in &cells_by_row {
+        let covered_by_rowspan = cells
+            .iter()
+            .any(|cell| cell.rowspan > 1 && cell.row <= row && row < cell.row + cell.rowspan);
+        if covered_by_rowspan {
+            continue;
+        }
+        if let Some(expansion) = build_tsr_row_expansion(row_cells, cells, &cell_lines) {
+            expansions.insert(row, expansion);
+        }
+    }
+
+    if expansions.is_empty() {
+        return None;
+    }
+
+    let mut expanded = Vec::with_capacity(cells.len() + expansions.len());
+    let mut row_shift = 0usize;
+    for (&row, row_cells) in &cells_by_row {
+        if let Some(expansion) = expansions.get(&row) {
+            for (band_idx, band) in expansion.bands.iter().enumerate() {
+                for &cell_idx in row_cells {
+                    let mut cell = cells[cell_idx].clone();
+                    cell.row = row + row_shift + band_idx;
+                    cell.rowspan = 1;
+                    cell.text = text_for_tsr_band(
+                        &cell_lines[cell_idx],
+                        *band,
+                        expansion.tolerance,
+                        adaptive_threshold,
+                    );
+                    cell.page_pt_bbox =
+                        slice_cell_bbox_for_expanded_row(&cell, band_idx, expansion.bands.len());
+                    expanded.push(cell);
+                }
+            }
+            row_shift += expansion.bands.len() - 1;
+        } else {
+            for &cell_idx in row_cells {
+                let mut cell = cells[cell_idx].clone();
+                cell.row += row_shift;
+                expanded.push(cell);
+            }
+        }
+    }
+
+    let original_rows = cells
+        .iter()
+        .map(|cell| cell.row + cell.rowspan.max(1))
+        .max()
+        .unwrap_or(0);
+    let expanded_rows = expanded
+        .iter()
+        .map(|cell| cell.row + cell.rowspan.max(1))
+        .max()
+        .unwrap_or(0);
+    (expanded_rows > original_rows).then_some(expanded)
+}
+
 /// Detect quality issues in the TSR-hybrid output for a single input.
 ///
-/// Returns `Some(reason)` if the cells look like they reflect a known
-/// SLANet detection pathology that the heuristic table extractor would
-/// likely handle better. Reasons (also used as metric labels):
+/// Returns `Some(issue)` if the cells look like they reflect a known
+/// SLANet detection pathology. Reasons (also used as metric labels):
 ///
 /// * `phantom_empty_row` — a row whose every cell is empty, surrounded
 ///   above and below by rows with content. SLANet sometimes emits an
@@ -1804,7 +2123,7 @@ fn detect_tsr_quality_issue(
     buffer: &[u8],
     input: &TsrTableInput,
     cells: &[tables::StructuredCell],
-) -> Result<Option<String>, PdfError> {
+) -> Result<Option<TsrQualityIssue>, PdfError> {
     if cells.is_empty() {
         return Ok(None);
     }
@@ -1820,7 +2139,7 @@ fn detect_tsr_quality_issue(
         }
         for r in 1..max_row {
             if !row_has_content[r] && row_has_content[r - 1] && row_has_content[r + 1] {
-                return Ok(Some("phantom_empty_row".to_string()));
+                return Ok(Some(TsrQualityIssue::PhantomEmptyRow));
             }
         }
     }
@@ -1849,12 +2168,14 @@ fn detect_tsr_quality_issue(
             &font_cmaps,
             false,
         )?;
-    let _ = text_utils::fix_letterspaced_items(&mut items);
+    let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
         RegionCoordSpace::Rotated90Ccw
     } else {
         RegionCoordSpace::Standard
     };
+    let expanded_cells =
+        try_expand_multi_row_cells(cells, &items, page_h, coords, adaptive_threshold);
 
     for cell in cells {
         // rowspan>1 cells are intentionally multi-line — skip them.
@@ -1864,57 +2185,12 @@ fn detect_tsr_quality_issue(
         if cell.text.trim().is_empty() {
             continue;
         }
-        let [x1, y1, x2, y2] = cell.page_pt_bbox;
-        if x1 >= x2 || y1 >= y2 {
-            continue;
-        }
-        let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
-
-        // Collect the items inside this cell, with their y-centers and
-        // half-heights so we can cluster them into visual lines.
-        let mut cell_items: Vec<(f32, f32)> = Vec::new();
-        for item in &items {
-            if tsr_region_contains_item(item, bounds) {
-                let cy = item.y + item.height * 0.5;
-                let half_h = (item.height * 0.5).max(2.5);
-                cell_items.push((cy, half_h));
-            }
-        }
+        let cell_items = collect_items_in_tsr_cell(&items, cell, page_h, coords);
         if cell_items.len() < 2 {
             continue;
         }
-        // Sort by y-center descending (top-of-page first in PDF native
-        // coords where y grows upward) — direction doesn't matter, we
-        // just need consecutive items to be neighbors in the sort.
-        cell_items.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-        // Walk pairs and see if there's a real whitespace gap between
-        // any two adjacent items — defined as their bounding-box edges
-        // separated by more than half a line height. This rules out
-        // tall glyphs / superscripts / accents on a single visual line.
-        let max_half_h = cell_items
-            .iter()
-            .map(|(_, h)| *h)
-            .fold(0f32, f32::max)
-            .max(2.5);
-        let gap_threshold = max_half_h; // ≈ half a line height
-        let mut found_gap = false;
-        for w in cell_items.windows(2) {
-            let (cy_a, h_a) = w[0];
-            let (cy_b, h_b) = w[1];
-            // Gap = distance between the bottom of the upper item and
-            // the top of the lower item, measured in PDF-native coords
-            // (y grows upward, so the upper item has the larger cy).
-            let upper_bottom = cy_a - h_a;
-            let lower_top = cy_b + h_b;
-            let gap = upper_bottom - lower_top;
-            if gap > gap_threshold {
-                found_gap = true;
-                break;
-            }
-        }
-        if found_gap {
-            return Ok(Some("multi_row_in_cell".to_string()));
+        if cluster_tsr_cell_text_lines(cell_items).len() >= 2 {
+            return Ok(Some(TsrQualityIssue::MultiRowInCell { expanded_cells }));
         }
     }
 
@@ -1927,9 +2203,11 @@ fn detect_tsr_quality_issue(
 /// and falls back to the heuristic [`extract_tables_in_regions_mem`]
 /// for any input where the TSR path looks compromised.
 ///
-/// On clean inputs this is identical to the markdown variant.
-/// On flagged inputs the heuristic markdown replaces the TSR markdown
-/// and the result's `fallback_reason` is set to the diagnostic label.
+/// On clean inputs this is identical to the markdown variant. On
+/// `multi_row_in_cell`, the wrapper first tries to expand over-stuffed
+/// rows in place; if that cannot produce a usable table, the heuristic
+/// markdown replaces the TSR markdown and `fallback_reason` is set to
+/// the diagnostic label.
 ///
 /// Two failure modes are guarded against per-input:
 ///
@@ -1939,6 +2217,9 @@ fn detect_tsr_quality_issue(
 ///   `_heuristic_empty` (e.g. `multi_row_in_cell_heuristic_empty`).
 ///   This avoids replacing a usable wrong-but-non-empty TSR output
 ///   with literally nothing.
+/// * **Expanded multi-row cells**: when in-place recovery succeeds, the
+///   result is labeled `multi_row_in_cell_expanded` and the heuristic is
+///   not consulted.
 /// * **Per-input errors**: any failure in detection or heuristic
 ///   extraction for a single input is contained — that input
 ///   returns the raw TSR markdown with `fallback_reason` set to
@@ -1983,7 +2264,21 @@ pub fn extract_tables_with_structure_auto_mem(
                 markdown: tsr_md,
                 fallback_reason: None,
             },
-            Some(reason) => {
+            Some(issue) => {
+                let reason = issue.reason().to_string();
+                if let TsrQualityIssue::MultiRowInCell {
+                    expanded_cells: Some(expanded_cells),
+                } = issue
+                {
+                    let expanded_md = tables::cells_to_markdown(&expanded_cells);
+                    if !expanded_md.trim().is_empty() {
+                        results.push(TableExtractionResult {
+                            markdown: expanded_md,
+                            fallback_reason: Some("multi_row_in_cell_expanded".to_string()),
+                        });
+                        continue;
+                    }
+                }
                 // Fall back to heuristic on the input's table region.
                 // The crop's PDF-pt bbox IS the table region.
                 let heuristic_md = match extract_tables_in_regions_mem(
@@ -3648,6 +3943,77 @@ mod tests {
         assert!(!cells[0].text.contains("Oak Street"));
         assert!(!cells[2].text.contains("Branch Name"));
         assert!(!cells[2].text.contains("Boardwalk"));
+    }
+
+    #[test]
+    fn multi_row_expansion_splits_overstuffed_tsr_row() {
+        use crate::tables::{cells_to_markdown, StructuredCell};
+
+        let items = vec![
+            test_item("Branch Name", 20.0, 166.0, 55.0, 8.0),
+            test_item("Deposits", 120.0, 166.0, 36.0, 8.0),
+            test_item("Oak Street", 20.0, 136.0, 48.0, 8.0),
+            test_item("100", 120.0, 136.0, 18.0, 8.0),
+            test_item("Boardwalk", 20.0, 116.0, 46.0, 8.0),
+            test_item("200", 120.0, 116.0, 18.0, 8.0),
+        ];
+        let cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: "Branch Name".into(),
+                page_pt_bbox: [10.0, 20.0, 100.0, 40.0],
+            },
+            StructuredCell {
+                row: 0,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: "Deposits".into(),
+                page_pt_bbox: [110.0, 20.0, 190.0, 40.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: "Oak Street Boardwalk".into(),
+                page_pt_bbox: [10.0, 40.0, 100.0, 100.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: "100 200".into(),
+                page_pt_bbox: [110.0, 40.0, 190.0, 100.0],
+            },
+        ];
+
+        let expanded =
+            try_expand_multi_row_cells(&cells, &items, 200.0, RegionCoordSpace::Standard, 0.10)
+                .expect("overstuffed data row should expand");
+        let md = cells_to_markdown(&expanded);
+
+        assert_eq!(expanded.iter().map(|c| c.row).max().unwrap() + 1, 3);
+        assert!(
+            md.contains("|Oak Street|100|"),
+            "missing first data row: {md}"
+        );
+        assert!(
+            md.contains("|Boardwalk|200|"),
+            "missing second data row: {md}"
+        );
+        assert!(
+            !md.contains("Oak Street Boardwalk"),
+            "compressed cell text should be replaced: {md}"
+        );
     }
 
     #[test]
