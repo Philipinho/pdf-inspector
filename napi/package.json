@@ -1,6 +1,6 @@
 {
   "name": "firecrawl-pdf-inspector",
-  "version": "1.9.2",
+  "version": "1.10.0",
   "description": "Fast PDF classification, text extraction, and image extraction. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -35,6 +35,8 @@
     "targets": [
       "x86_64-unknown-linux-gnu",
       "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
       "aarch64-apple-darwin",
       "x86_64-pc-windows-msvc"
     ],

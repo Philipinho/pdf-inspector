@@ -81,9 +81,46 @@ jobs:
             napi/README.md
           if-no-files-found: error
 
+  build-musl:
+    name: Build ${{ matrix.target }} (Alpine)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            docker-platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            docker-platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 emulation)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build inside Alpine container
+        run: |
+          docker run --rm \
+            --platform ${{ matrix.docker-platform }} \
+            -v "$PWD":/work \
+            -w /work \
+            ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine \
+            sh -c "
+              cd napi && \
+              npm install --ignore-scripts && \
+              npx napi build --platform --release --target ${{ matrix.target }}
+            "
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: napi/*.node
+          if-no-files-found: error
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-musl]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
