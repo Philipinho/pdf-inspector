@@ -2152,13 +2152,15 @@ fn try_expand_multi_row_cells(
 /// * `phantom_empty_row` — a row whose every cell is empty, surrounded
 ///   above and below by rows with content. SLANet sometimes emits an
 ///   extra row that doesn't correspond to any visible PDF row.
-/// * `multi_row_in_cell` — at least one `rowspan==1` cell encloses
-///   PDF text items that cluster into two distinct visual lines
+/// * `multi_row_in_cell` — at least one non-label `rowspan==1` cell
+///   encloses PDF text items that cluster into two distinct visual lines
 ///   separated by a whitespace gap larger than the line height. Cells
 ///   declared as `rowspan>1` are excluded since they are *expected*
-///   to span multiple lines. SLANet's row under-detection on
-///   tightly-packed tables produces the rowspan==1-but-multi-line
-///   pattern (the FNBO failure mode).
+///   to span multiple lines. First-row/first-column wraps are ignored
+///   unless the in-place row expansion has enough support to repair them,
+///   because those are often legitimate wrapped headers or row labels.
+///   SLANet's row under-detection on tightly-packed tables produces the
+///   rowspan==1-but-multi-line pattern (the FNBO failure mode).
 fn detect_tsr_quality_issue(
     buffer: &[u8],
     input: &TsrTableInput,
@@ -2216,6 +2218,8 @@ fn detect_tsr_quality_issue(
     };
     let expanded_cells =
         try_expand_multi_row_cells(cells, &items, page_h, coords, adaptive_threshold);
+    let first_row = cells.iter().map(|cell| cell.row).min().unwrap_or(0);
+    let first_col = cells.iter().map(|cell| cell.col).min().unwrap_or(0);
 
     for cell in cells {
         // rowspan>1 cells are intentionally multi-line — skip them.
@@ -2229,12 +2233,28 @@ fn detect_tsr_quality_issue(
         if cell_items.len() < 2 {
             continue;
         }
-        if cluster_tsr_cell_text_lines(cell_items).len() >= 2 {
+        if cluster_tsr_cell_text_lines(cell_items).len() < 2 {
+            continue;
+        }
+        if expanded_cells.is_some() {
             return Ok(Some(TsrQualityIssue::MultiRowInCell { expanded_cells }));
+        }
+        if !is_wrapped_tsr_label_cell(cell, first_row, first_col) {
+            return Ok(Some(TsrQualityIssue::MultiRowInCell {
+                expanded_cells: None,
+            }));
         }
     }
 
     Ok(None)
+}
+
+fn is_wrapped_tsr_label_cell(
+    cell: &tables::StructuredCell,
+    first_row: usize,
+    first_col: usize,
+) -> bool {
+    cell.is_header || cell.row == first_row || cell.col == first_col
 }
 
 /// Auto-fallback variant of [`extract_tables_with_structure_mem`]:
