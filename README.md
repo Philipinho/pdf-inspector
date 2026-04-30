@@ -4,6 +4,28 @@ Fast Rust library for PDF classification and text extraction. Detects whether a 
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
+## About this fork
+
+This is a fork of [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector).
+
+**What this fork adds:**
+
+- **`extractImages(buffer)`** — Extract embedded raster images from a PDF as raw `Buffer` data, with page number, position, dimensions, and format.
+- **`processPdfWithImages(buffer)`** — Process a PDF and return markdown + images in one call. The markdown contains `![image](pdf-image://N)` placeholders where `N` matches the index in the returned `images` array. Useful for PDF-to-content imports where images need to be uploaded and re-linked at their original positions.
+- **JPEG support** — DCTDecode, including chained streams like `[/FlateDecode /DCTDecode]` (zlib-wrapped JPEGs).
+- **PNG support** — FlateDecode with full PNG predictor un-filtering (None, Sub, Up, Average, Paeth).
+- **Color spaces** — DeviceRGB, DeviceGray, DeviceCMYK (converted to RGB), ICCBased, CalRGB, CalGray.
+- **Zero-cost when not needed** — `processPdf` and `extractText` skip image processing entirely.
+- **Extra build targets** — prebuilt binaries for `linux-arm64-gnu` and `win32-x64-msvc` in addition to upstream's `linux-x64-gnu` and `darwin-arm64`.
+
+**Install (Node.js):**
+
+```bash
+npm install @docmost/pdf-inspector
+```
+
+See [napi/README.md](napi/README.md) for the full Node.js API.
+
 ## Features
 
 - **Smart classification** — Detect TextBased, Scanned, ImageBased, or Mixed PDFs in ~10-50ms by sampling content streams. Returns a confidence score (0.0-1.0) and per-page OCR routing.
