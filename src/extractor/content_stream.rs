@@ -1142,7 +1142,17 @@ fn extract_image_xobject(
 
     match filter.as_deref() {
         Some(b"DCTDecode") => {
-            // JPEG — raw stream content is the JPEG file
+            // For chained filters like [/FlateDecode /DCTDecode], the JPEG
+            // payload is wrapped in additional compression layers. Apply each
+            // filter in array order; DCTDecode marks the end (the result IS
+            // the JPEG file).
+            let data = decode_filters_for_jpeg(stream)?;
+            // Sanity check: a real JPEG must start with the SOI marker FFD8.
+            // If it doesn't, something is wrong (unsupported filter chain or
+            // mis-detected DCT) — skip rather than emit a corrupt file.
+            if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
+                return None;
+            }
             Some(ExtractedImage {
                 page: page_num,
                 x: ctm[4],
@@ -1150,12 +1160,144 @@ fn extract_image_xobject(
                 width,
                 height,
                 format: ImageFormat::Jpeg,
-                data: stream.content.clone(),
+                data,
             })
         }
         Some(b"FlateDecode") => encode_flatedecode_to_png(stream, width, height, page_num, ctm),
         _ => None,
     }
+}
+
+/// Apply the filter chain on a DCTDecode stream and return the raw JPEG bytes.
+///
+/// Handles common pre-DCT filters (FlateDecode, ASCII85Decode, ASCIIHexDecode).
+/// Returns `None` if any unsupported filter appears.
+fn decode_filters_for_jpeg(stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    let filters: Vec<Vec<u8>> = match stream.dict.get(b"Filter").ok()? {
+        Object::Name(n) => vec![n.clone()],
+        Object::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_name().ok().map(|n| n.to_vec()))
+            .collect(),
+        _ => return None,
+    };
+
+    let mut data = stream.content.clone();
+    for filter in &filters {
+        match filter.as_slice() {
+            // End of the chain — the bytes ARE the JPEG file.
+            b"DCTDecode" => return Some(data),
+            b"FlateDecode" => {
+                use flate2::read::ZlibDecoder;
+                use std::io::Read;
+                let mut decoder = ZlibDecoder::new(&data[..]);
+                let mut out = Vec::new();
+                if decoder.read_to_end(&mut out).is_err() {
+                    return None;
+                }
+                data = out;
+            }
+            b"ASCIIHexDecode" => {
+                data = ascii_hex_decode(&data)?;
+            }
+            b"ASCII85Decode" => {
+                data = ascii85_decode(&data)?;
+            }
+            // Other filters (LZWDecode, RunLengthDecode, JBIG2Decode) — skip.
+            _ => return None,
+        }
+    }
+    // Reached end of chain without a DCTDecode marker — shouldn't happen
+    // since we only call this for DCT-tagged streams.
+    Some(data)
+}
+
+/// Decode an ASCIIHex-encoded byte stream. Whitespace is ignored, `>` ends.
+fn ascii_hex_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() / 2);
+    let mut nibble: Option<u8> = None;
+    for &b in data {
+        if b == b'>' {
+            break;
+        }
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let v = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        match nibble {
+            Some(hi) => {
+                out.push((hi << 4) | v);
+                nibble = None;
+            }
+            None => nibble = Some(v),
+        }
+    }
+    // Trailing odd nibble: low half is implicitly 0.
+    if let Some(hi) = nibble {
+        out.push(hi << 4);
+    }
+    Some(out)
+}
+
+/// Decode an ASCII85-encoded byte stream. `~>` ends.
+fn ascii85_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() * 4 / 5);
+    let mut group: [u8; 5] = [0; 5];
+    let mut count: usize = 0;
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        i += 1;
+        if b == b'~' {
+            // EOD marker `~>`
+            break;
+        }
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'z' && count == 0 {
+            // Shorthand for four zero bytes.
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        if !(b'!'..=b'u').contains(&b) {
+            return None;
+        }
+        group[count] = b - b'!';
+        count += 1;
+        if count == 5 {
+            let value = group.iter().try_fold(0u32, |acc, &c| {
+                acc.checked_mul(85).and_then(|v| v.checked_add(c as u32))
+            })?;
+            out.push((value >> 24) as u8);
+            out.push((value >> 16) as u8);
+            out.push((value >> 8) as u8);
+            out.push(value as u8);
+            count = 0;
+        }
+    }
+    if count > 0 {
+        // Pad with `u` (84) and emit count-1 bytes.
+        for slot in group.iter_mut().skip(count) {
+            *slot = 84;
+        }
+        let value = group.iter().try_fold(0u32, |acc, &c| {
+            acc.checked_mul(85).and_then(|v| v.checked_add(c as u32))
+        })?;
+        let bytes = [
+            (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ];
+        out.extend_from_slice(&bytes[..count - 1]);
+    }
+    Some(out)
 }
 
 /// Color space info resolved from a PDF image dictionary.
