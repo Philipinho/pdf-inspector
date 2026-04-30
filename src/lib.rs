@@ -1011,6 +1011,46 @@ fn crop_px_bbox_is_plausible(
 mod vector_grid_tests {
     use super::crop_px_bbox_is_plausible;
 
+    /// Regression for `forecast_table_chart.pdf` (doc 128 from the
+    /// opendataloader-bench corpus). The table has six visual columns, but
+    /// text X-clustering in the cell-rect fallback previously split wide
+    /// columns into ten spurious columns.
+    #[test]
+    fn forecast_table_chart_six_cols() {
+        use crate::extractor::content_stream::extract_page_text_items;
+        use crate::tables::detect_tables_from_rects;
+        use crate::tounicode::FontCMaps;
+        use lopdf::Document;
+        use std::collections::HashSet;
+        use std::fs;
+
+        let path = "tests/fixtures/forecast_table_chart.pdf";
+        let buf = fs::read(path).unwrap();
+        let doc = Document::load_mem(&buf).unwrap();
+        let pages = doc.get_pages();
+        let &page_id = pages.get(&1).unwrap();
+        let needed: HashSet<u32> = HashSet::from([1]);
+        let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
+        let ((items, rects, _lines), _images, _has_gid, _rotated) =
+            extract_page_text_items(&doc, page_id, 1, &cmaps, false).unwrap();
+
+        let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
+        let t = &rect_tables[0];
+        assert_eq!(
+            t.columns.len(),
+            6,
+            "doc 128 has a 6-column table; got {} edges: {:?}",
+            t.columns.len(),
+            t.columns
+        );
+        assert!(
+            t.rows.len() >= 14 && t.rows.len() <= 17,
+            "row count drift: {}",
+            t.rows.len()
+        );
+    }
+
     #[test]
     fn test_crop_px_bbox_is_plausible_bounds() {
         let crop = [10.0, 20.0, 110.0, 220.0];
