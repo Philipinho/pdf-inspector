@@ -1,12 +1,9 @@
 {
   "name": "firecrawl-pdf-inspector",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "Fast PDF classification, text extraction, and image extraction. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
-  "bin": {
-    "pdf-inspector": "bin/pdf-inspector.mjs"
-  },
   "license": "MIT",
   "keywords": [
     "pdf",
@@ -23,7 +20,6 @@
     "index.js",
     "index.d.ts",
     "*.node",
-    "bin/",
     "README.md"
   ],
   "repository": {
