@@ -7,6 +7,8 @@ import {
   extractText,
   extractTextWithPositions,
   extractTextInRegions,
+  detectVectorGridInRegion,
+  extractPagesMarkdown,
 } from './index.js';
 
 const fixture = readFileSync('../tests/fixtures/thermo-freon12.pdf');
@@ -88,6 +90,39 @@ assert.equal(regionResults[0].regions.length, 1);
 assert.equal(typeof regionResults[0].regions[0].text, 'string');
 assert.equal(typeof regionResults[0].regions[0].needsOcr, 'boolean');
 console.log('  extractTextInRegions: OK');
+
+// --- detectVectorGridInRegion ---
+console.log('Testing detectVectorGridInRegion...');
+const vectorGrid = detectVectorGridInRegion(fixture, 0, [0, 0, 600, 800], 72);
+assert.ok(vectorGrid === null || typeof vectorGrid === 'object');
+if (vectorGrid) {
+  assert.ok(Array.isArray(vectorGrid.structureTokens));
+  assert.ok(Array.isArray(vectorGrid.cellBboxes));
+  assert.ok(vectorGrid.cellBboxes.every(bbox => Array.isArray(bbox) && bbox.length === 4));
+}
+console.log('  detectVectorGridInRegion: OK');
+
+// --- extractPagesMarkdown ---
+console.log('Testing extractPagesMarkdown...');
+
+// omit pages → every page in document order
+const allPages = extractPagesMarkdown(fixture);
+assert.equal(allPages.pages.length, 3);
+assert.deepEqual(allPages.pages.map(p => p.page), [0, 1, 2]);
+assert.ok(typeof allPages.pages[0].markdown === 'string');
+assert.equal(typeof allPages.pages[0].needsOcr, 'boolean');
+assert.ok(Array.isArray(allPages.pagesWithTables));
+assert.ok(Array.isArray(allPages.pagesWithColumns));
+assert.ok(Array.isArray(allPages.pagesNeedingOcr));
+assert.equal(typeof allPages.isComplex, 'boolean');
+console.log('  extractPagesMarkdown (no pages arg): OK');
+
+// selected pages preserve caller order
+const picked = extractPagesMarkdown(fixture, [2, 0]);
+assert.equal(picked.pages.length, 2);
+assert.equal(picked.pages[0].page, 2);
+assert.equal(picked.pages[1].page, 0);
+console.log('  extractPagesMarkdown with pages: OK');
 
 // --- Error handling ---
 console.log('Testing error handling...');

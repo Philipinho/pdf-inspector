@@ -1,4 +1,4 @@
-# firecrawl-pdf-inspector
+# PDF Inspector
 
 Fast PDF classification, text extraction, and image extraction for Node.js/Bun. Native Rust performance via [napi-rs](https://napi.rs).
 
@@ -12,7 +12,7 @@ npm install firecrawl-pdf-inspector
 bun add firecrawl-pdf-inspector
 ```
 
-Prebuilt binaries included for **linux-x64** and **macOS ARM64**. No Rust toolchain needed.
+Prebuilt binaries included for **linux-x64**, **linux-arm64**, **macOS ARM64**, and **windows-x64**. No Rust toolchain needed.
 
 ## API
 
@@ -202,9 +202,11 @@ Text extraction and image extraction are independent paths. `processPdf` and `ex
 ## Platforms
 
 | Platform | Architecture | Supported |
-|----------|-------------|-----------|
-| Linux    | x64         | Yes       |
-| macOS    | ARM64       | Yes       |
+|----------|--------------|-----------|
+| Linux    | x64          | Yes       |
+| Linux    | ARM64        | Yes       |
+| macOS    | ARM64        | Yes       |
+| Windows  | x64          | Yes       |
 
 ## License
 
