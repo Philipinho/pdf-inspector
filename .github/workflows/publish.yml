@@ -16,6 +16,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -25,10 +27,18 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install cross-compilation toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -38,17 +48,19 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             napi/target/
-          key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-napi-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-napi-
 
       - name: Install dependencies
         working-directory: napi
-        run: bun install
+        run: npm install --ignore-scripts
 
       - name: Build native addon
         working-directory: napi
-        run: bunx napi build --platform --release
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+        run: npx napi build --platform --release --target ${{ matrix.target }}
 
       - name: Upload native binary
         uses: actions/upload-artifact@v4
@@ -65,6 +77,8 @@ jobs:
           path: |
             napi/index.js
             napi/index.d.ts
+            napi/package.json
+            napi/README.md
           if-no-files-found: error
 
   publish:
@@ -75,26 +89,26 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: napi/artifacts
+          path: artifacts
 
-      - name: Collect binaries and publish
-        working-directory: napi
+      - name: Assemble package
         run: |
-          cp artifacts/bindings-*/*.node .
-          cp artifacts/js-bindings/index.js .
-          cp artifacts/js-bindings/index.d.ts .
-
+          mkdir -p publish-pkg
+          cp artifacts/js-bindings/* publish-pkg/
+          cp artifacts/bindings-*/*.node publish-pkg/
           echo "=== Package contents ==="
-          ls -la *.node index.js index.d.ts
+          ls -la publish-pkg/
 
-          npm publish --provenance --access public
+      - name: Publish to npm
+        working-directory: publish-pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
