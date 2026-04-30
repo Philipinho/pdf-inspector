@@ -1587,24 +1587,68 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
-    // Derive columns from text X-position clustering
+    // Derive columns from text X-position clustering, but prefer rect
+    // X-edges when they already provide a tighter scaffold.  Some PDFs draw
+    // only the row-index cells in the body plus a full header row; that is
+    // not dense enough for `try_build_grid`, but the header rects still define
+    // the real columns.  Text starts inside wide cells can otherwise split the
+    // table into spurious sub-columns.
     let columns = cluster_x_positions(&page_items, 15.0);
-    if columns.len() < 2 {
+    let text_col_edges = if columns.len() >= 2 {
+        let mut edges: Vec<f32> = Vec::with_capacity(columns.len() + 1);
+        let min_x = page_items.iter().map(|(_, i)| i.x).reduce(f32::min)?;
+        edges.push(min_x - 5.0);
+        for pair in columns.windows(2) {
+            edges.push((pair[0] + pair[1]) / 2.0);
+        }
+        let max_x_right = page_items
+            .iter()
+            .map(|(_, i)| i.x + i.width)
+            .reduce(f32::max)?;
+        edges.push(max_x_right + 5.0);
+        Some(edges)
+    } else {
+        None
+    };
+
+    let rect_col_edges = {
+        let mut x_vals = Vec::with_capacity(content_rects.len() * 2);
+        for &&(x, _, w, _) in &content_rects {
+            x_vals.push(x);
+            x_vals.push(x + w);
+        }
+        let mut edges = snap_edges(&x_vals, 6.0);
+        edges.sort_by(|a, b| a.total_cmp(b));
+        if (3..=26).contains(&edges.len()) {
+            Some(edges)
+        } else {
+            None
+        }
+    };
+
+    let col_edges = match (rect_col_edges, text_col_edges) {
+        (Some(rect_edges), Some(text_edges)) if rect_edges.len() <= text_edges.len() => {
+            debug!(
+                "  cell-rect using {} rect-derived columns over {} text clusters",
+                rect_edges.len() - 1,
+                text_edges.len() - 1
+            );
+            rect_edges
+        }
+        (_, Some(text_edges)) => text_edges,
+        (Some(rect_edges), None) => rect_edges,
+        (None, None) => {
+            debug!(
+                "  cell-rect rejected: only {} columns from text clustering",
+                columns.len()
+            );
+            return None;
+        }
+    };
+
+    if col_edges.len() < 3 {
         return None;
     }
-
-    // Build column edges
-    let mut col_edges: Vec<f32> = Vec::with_capacity(columns.len() + 1);
-    let min_x = page_items.iter().map(|(_, i)| i.x).reduce(f32::min)?;
-    col_edges.push(min_x - 5.0);
-    for pair in columns.windows(2) {
-        col_edges.push((pair[0] + pair[1]) / 2.0);
-    }
-    let max_x_right = page_items
-        .iter()
-        .map(|(_, i)| i.x + i.width)
-        .reduce(f32::max)?;
-    col_edges.push(max_x_right + 5.0);
 
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
