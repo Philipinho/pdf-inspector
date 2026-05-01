@@ -1,6 +1,6 @@
 {
   "name": "@docmost/pdf-inspector",
-  "version": "1.9.3",
+  "version": "1.9.4",
   "description": "Fast PDF classification, text extraction, and image extraction. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",

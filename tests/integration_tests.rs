@@ -2534,6 +2534,61 @@ fn test_auto_expands_under_counted_vector_grid_rows() {
 }
 
 #[test]
+fn test_auto_keeps_wrapped_header_vector_grid_doc51() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = std::fs::read("tests/fixtures/government_positions_women.pdf").unwrap();
+    let crop = [0.0, 0.0, 612.0, 792.0];
+    let grid = detect_vector_grid_in_region_mem(&buf, 0, crop, 200.0)
+        .unwrap()
+        .expect("expected doc 51 vector grid");
+    assert_eq!(
+        grid.cell_bboxes.len(),
+        36,
+        "doc 51 should have a 9x4 vector grid"
+    );
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: crop,
+            render_dpi: 200.0,
+            structure_tokens: grid.structure_tokens,
+            cell_bboxes: grid.cell_bboxes,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert!(
+        r.fallback_reason.is_none(),
+        "wrapped header/label text should not trigger heuristic fallback: {:?}\n{}",
+        r.fallback_reason,
+        r.markdown
+    );
+    let md = &r.markdown;
+    assert!(md.contains("Government Position"), "missing header: {md}");
+    assert!(
+        md.contains("Aquino Administration"),
+        "missing Aquino header: {md}"
+    );
+    assert!(
+        md.contains("Ramos Administration"),
+        "missing Ramos header: {md}"
+    );
+    assert!(
+        md.contains("City Municipal Councilor"),
+        "row label was truncated: {md}"
+    );
+    assert!(
+        !md.contains("|Position||Administration"),
+        "heuristic fallback split the header row: {md}"
+    );
+}
+
+#[test]
 fn test_auto_returns_empty_inputs() {
     use pdf_inspector::extract_tables_with_structure_auto_mem;
     let buf = synthetic_dense_table_pdf();
